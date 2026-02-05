@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import asyncpg
 from dotenv import load_dotenv
@@ -33,10 +33,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 10000))
 
 if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_URL]):
-    raise ValueError("Missing required environment variables")
+    raise ValueError("Missing required environment variables: BOT_TOKEN, DATABASE_URL, WEBHOOK_URL")
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
@@ -375,7 +375,7 @@ async def error_handler(event, **kwargs):
     return True
 
 # Основная функция запуска
-async def on_startup():
+async def on_startup(app: web.Application = None):
     """Действия при запуске бота"""
     # Подключение к БД
     await db.connect()
@@ -388,7 +388,7 @@ async def on_startup():
     )
     logger.info(f"Webhook set to: {webhook_url}")
 
-async def on_shutdown():
+async def on_shutdown(app: web.Application = None):
     """Действия при остановке бота"""
     # Закрытие соединения с БД
     await db.close()
@@ -402,6 +402,10 @@ def main():
     # Создание aiohttp приложения
     app = web.Application()
     
+    # Настройка событий запуска и остановки
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
     # Создание обработчика webhook
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
@@ -411,10 +415,6 @@ def main():
     
     # Настройка маршрутов
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-    
-    # Настройка событий запуска и остановки
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
     
     # Запуск сервера
     setup_application(app, dp, bot=bot)
