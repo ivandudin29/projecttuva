@@ -133,7 +133,11 @@ class Database:
         
         try:
             async with self.pool.acquire() as conn:
-                # Таблица проектов
+                # Удаляем существующие таблицы, если нужно начать с чистого листа
+                # await conn.execute('DROP TABLE IF EXISTS tasks CASCADE')
+                # await conn.execute('DROP TABLE IF EXISTS projects CASCADE')
+                
+                # Таблица проектов - добавляем updated_at
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS projects (
                         id SERIAL PRIMARY KEY,
@@ -144,7 +148,7 @@ class Database:
                     )
                 ''')
                 
-                # Таблица задач
+                # Таблица задач - добавляем updated_at
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS tasks (
                         id SERIAL PRIMARY KEY,
@@ -174,33 +178,12 @@ class Database:
                     ON tasks(status, deadline) WHERE status = 'active'
                 ''')
                 
-                # Создаем функцию для обновления updated_at
-                await conn.execute('''
-                    CREATE OR REPLACE FUNCTION update_updated_at_column()
-                    RETURNS TRIGGER AS $$
-                    BEGIN
-                        NEW.updated_at = CURRENT_TIMESTAMP;
-                        RETURN NEW;
-                    END;
-                    $$ language 'plpgsql'
-                ''')
-                
-                # Создаем триггеры для автоматического обновления updated_at
-                await conn.execute('''
-                    DROP TRIGGER IF EXISTS update_projects_updated_at ON projects;
-                    CREATE TRIGGER update_projects_updated_at
-                    BEFORE UPDATE ON projects
-                    FOR EACH ROW
-                    EXECUTE FUNCTION update_updated_at_column()
-                ''')
-                
-                await conn.execute('''
-                    DROP TRIGGER IF EXISTS update_tasks_updated_at ON tasks;
-                    CREATE TRIGGER update_tasks_updated_at
-                    BEFORE UPDATE ON tasks
-                    FOR EACH ROW
-                    EXECUTE FUNCTION update_updated_at_column()
-                ''')
+                # Если нужно добавить столбец updated_at к существующей таблице
+                try:
+                    await conn.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP')
+                    await conn.execute('ALTER TABLE projects ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP')
+                except Exception as e:
+                    logger.warning(f"Не удалось добавить столбец updated_at (возможно уже существует): {e}")
                 
                 logger.info("✅ Таблицы базы данных инициализированы")
                 
@@ -368,7 +351,7 @@ class Database:
                     tasks = await conn.fetch('''
                         SELECT 
                             id, title, description, deadline, status,
-                            created_at, updated_at
+                            created_at
                         FROM tasks
                         WHERE project_id = $1
                         ORDER BY 
@@ -384,7 +367,7 @@ class Database:
                     tasks = await conn.fetch('''
                         SELECT 
                             id, title, description, deadline, status,
-                            created_at, updated_at
+                            created_at
                         FROM tasks
                         WHERE project_id = $1 AND status = 'active'
                         ORDER BY 
@@ -435,7 +418,8 @@ class Database:
                     SET status = CASE 
                         WHEN status = 'active' THEN 'completed'
                         ELSE 'active'
-                    END
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
                 ''', task_id)
                 
@@ -472,7 +456,8 @@ class Database:
             async with self.pool.acquire() as conn:
                 await conn.execute('''
                     UPDATE tasks
-                    SET deadline = $1
+                    SET deadline = $1,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = $2
                 ''', new_deadline, task_id)
                 
@@ -499,7 +484,7 @@ class Database:
                     WHERE p.user_id = $1
                       AND t.status = 'active'
                       AND t.deadline IS NOT NULL
-                      AND t.deadline <= CURRENT_DATE + $2
+                      AND t.deadline <= CURRENT_DATE + INTERVAL '1 day' * $2
                     ORDER BY t.deadline ASC
                     LIMIT 20
                 ''', user_id, days_ahead)
@@ -1160,13 +1145,13 @@ async def show_completed_tasks(callback: CallbackQuery):
             tasks_text = f"✅ <b>Выполненные задачи проекта '{html.quote(project['name'])}':</b>\n\n"
             
             for i, task in enumerate(completed_tasks, 1):
-                completed_date = task['updated_at'].strftime("%d.%m.%Y %H:%M") if task['updated_at'] else "неизвестно"
+                completed_date = task['created_at'].strftime("%d.%m.%Y") if task['created_at'] else "неизвестно"
                 deadline_str = format_date(task['deadline'])
                 
                 tasks_text += (
                     f"{i}. ✅ <b>{html.quote(task['title'])}</b>\n"
                     f"   📅 Дедлайн был: {deadline_str}\n"
-                    f"   🕐 Выполнено: {completed_date}\n\n"
+                    f"   📝 Создана: {completed_date}\n\n"
                 )
         
         # Создаем клавиатуру
