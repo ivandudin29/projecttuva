@@ -7,10 +7,10 @@ Task Planner Bot - Telegram бот для управления проектам�
 import os
 import logging
 import asyncio
-import threading
-import time
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
+from threading import Thread
+import time
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router, F, html
@@ -21,12 +21,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardRemove
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiohttp import web
-from aiohttp.web import Response
 import aiohttp
 
 # ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
@@ -135,7 +136,7 @@ class Database:
         
         try:
             async with self.pool.acquire() as conn:
-                # Таблица проектов
+                # Таблица проектов - добавляем updated_at
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS projects (
                         id SERIAL PRIMARY KEY,
@@ -146,7 +147,7 @@ class Database:
                     )
                 ''')
                 
-                # Таблица задач
+                # Таблица задач - добавляем updated_at
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS tasks (
                         id SERIAL PRIMARY KEY,
@@ -175,6 +176,13 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_tasks_status_deadline 
                     ON tasks(status, deadline) WHERE status = 'active'
                 ''')
+                
+                # Если нужно добавить столбец updated_at к существующей таблице
+                try:
+                    await conn.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP')
+                    await conn.execute('ALTER TABLE projects ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP')
+                except Exception as e:
+                    logger.warning(f"Не удалось добавить столбец updated_at (возможно уже существует): {e}")
                 
                 logger.info("✅ Таблицы базы данных инициализированы")
                 
@@ -287,6 +295,25 @@ class Database:
                 
         except Exception as e:
             logger.error(f"❌ Ошибка при удалении проекта: {e}")
+            return False
+    
+    async def update_project_name(self, project_id: int, new_name: str) -> bool:
+        """Обновление названия проекта"""
+        if not self.pool:
+            return False
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    UPDATE projects
+                    SET name = $1
+                    WHERE id = $2
+                ''', new_name[:255], project_id)
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обновлении проекта: {e}")
             return False
     
     # ========== МЕТОДЫ ДЛЯ РАБОТЫ С ЗАДАЧАМИ ==========
@@ -417,6 +444,26 @@ class Database:
                 
         except Exception as e:
             logger.error(f"❌ Ошибка при удалении задачи: {e}")
+            return False
+    
+    async def update_task_deadline(self, task_id: int, new_deadline: Optional[date]) -> bool:
+        """Обновление дедлайна задачи"""
+        if not self.pool:
+            return False
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    UPDATE tasks
+                    SET deadline = $1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2
+                ''', new_deadline, task_id)
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обновлении дедлайна: {e}")
             return False
     
     async def get_upcoming_tasks(self, user_id: int, days_ahead: int = 7) -> List[Dict[str, Any]]:
@@ -1203,7 +1250,7 @@ async def handle_other_messages(message: Message):
             reply_markup=get_main_keyboard()
         )
 
-# ==================== HTTP HANDLERS (KEEP-ALIVE) ====================
+# ==================== WEBHOOK И СЕРВЕР ====================
 
 async def health_check(request):
     """Endpoint для проверки работоспособности"""
@@ -1211,169 +1258,51 @@ async def health_check(request):
         # Проверяем подключение к базе данных
         db_healthy = await db.health_check() if DATABASE_URL else True
         
-        health_data = {
-            "status": "healthy" if db_healthy else "degraded",
-            "service": "Task Planner Telegram Bot",
-            "webhook": WEBHOOK_URL,
-            "database": "connected" if db_healthy else "disconnected",
-            "timestamp": datetime.now().isoformat(),
-            "uptime": time.time() - start_time
-        }
-        
-        status = 200 if db_healthy else 503
-        return web.json_response(health_data, status=status)
-        
+        if db_healthy:
+            return web.Response(
+                text="✅ OK - Bot is running\n"
+                     f"Database: {'Connected' if DATABASE_URL else 'Not configured'}\n"
+                     f"Webhook: {WEBHOOK_URL}\n"
+                     f"Uptime: {time.time() - start_time:.0f} seconds",
+                status=200
+            )
+        else:
+            return web.Response(
+                text="⚠️ WARNING - Database connection failed",
+                status=503
+            )
     except Exception as e:
         logger.error(f"Health check error: {e}")
-        return web.json_response(
-            {"status": "error", "message": str(e)},
+        return web.Response(
+            text=f"❌ ERROR - {str(e)}",
             status=500
         )
 
-async def home_page(request):
-    """Домашняя страница"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Task Planner Bot</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-            .healthy { background-color: #d4edda; color: #155724; }
-            .degraded { background-color: #fff3cd; color: #856404; }
-            .error { background-color: #f8d7da; color: #721c24; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🤖 Task Planner Bot</h1>
-            <p>Telegram bot для управления проектами и задачами</p>
-            
-            <div class="status" id="status">Проверка статуса...</div>
-            
-            <h2>📊 Endpoints:</h2>
-            <ul>
-                <li><a href="/health">/health</a> - Проверка здоровья</li>
-                <li><a href="/ping">/ping</a> - Простой пинг</li>
-                <li><a href="/info">/info</a> - Информация о боте</li>
-            </ul>
-            
-            <h2>🔗 Ссылки:</h2>
-            <ul>
-                <li><a href="https://t.me/YOUR_BOT_USERNAME">Telegram Bot</a></li>
-                <li><a href="https://render.com">Render Dashboard</a></li>
-            </ul>
-            
-            <p><em>Сервис поддерживается активным через UptimeRobot</em></p>
-        </div>
-        
-        <script>
-            fetch('/health')
-                .then(response => response.json())
-                .then(data => {
-                    const statusDiv = document.getElementById('status');
-                    if (data.status === 'healthy') {
-                        statusDiv.className = 'status healthy';
-                        statusDiv.innerHTML = '✅ <strong>Бот работает нормально</strong><br>' +
-                            'База данных: ' + (data.database || 'unknown') + '<br>' +
-                            'Webhook: ' + (data.webhook ? 'установлен' : 'не установлен');
-                    } else if (data.status === 'degraded') {
-                        statusDiv.className = 'status degraded';
-                        statusDiv.innerHTML = '⚠️ <strong>Бот работает с ограничениями</strong><br>' +
-                            'База данных: ' + (data.database || 'disconnected');
-                    } else {
-                        statusDiv.className = 'status error';
-                        statusDiv.innerHTML = '❌ <strong>Ошибка</strong><br>' + data.message;
-                    }
-                })
-                .catch(error => {
-                    document.getElementById('status').className = 'status error';
-                    document.getElementById('status').innerHTML = '❌ <strong>Ошибка подключения</strong>';
-                });
-        </script>
-    </body>
-    </html>
-    """
-    return web.Response(text=html_content, content_type='text/html')
-
-async def ping_handler(request):
-    """Простой пинг-эндпоинт"""
-    return web.Response(text="pong\n" + datetime.now().isoformat())
-
-async def info_handler(request):
-    """Информация о боте"""
-    info = {
-        "bot": "Task Planner Bot",
-        "status": "running",
-        "webhook_url": WEBHOOK_URL,
-        "webhook_set": False,
-        "database": "connected" if DATABASE_URL else "not_configured",
-        "start_time": datetime.fromtimestamp(start_time).isoformat(),
-        "uptime_seconds": time.time() - start_time,
-        "environment": "production"
-    }
-    
-    # Проверяем вебхук
+async def keep_alive_endpoint(request):
+    """Endpoint для поддержания приложения активным"""
     try:
-        webhook_info = await bot.get_webhook_info()
-        info["webhook_set"] = webhook_info.url == WEBHOOK_URL
-        info["webhook_info"] = {
-            "url": webhook_info.url,
-            "has_custom_certificate": webhook_info.has_custom_certificate,
-            "pending_update_count": webhook_info.pending_update_count
-        }
-    except Exception as e:
-        info["webhook_error"] = str(e)
-    
-    return web.json_response(info)
-
-async def set_webhook_handler(request):
-    """Ручная установка вебхука"""
-    try:
-        await bot.set_webhook(
-            url=WEBHOOK_URL,
-            drop_pending_updates=True,
-            secret_token=WEBHOOK_SECRET
+        # Простая проверка, возвращаем OK
+        return web.Response(
+            text="✅ Keep-alive endpoint is working\n"
+                 f"Timestamp: {datetime.now().isoformat()}\n"
+                 f"Bot is alive and responding",
+            status=200
         )
-        return web.json_response({"status": "success", "message": "Webhook set successfully"})
     except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        return web.Response(
+            text=f"❌ Error: {str(e)}",
+            status=500
+        )
 
-async def delete_webhook_handler(request):
-    """Удаление вебхука"""
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        return web.json_response({"status": "success", "message": "Webhook deleted successfully"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+async def handle_webhook_test(request):
+    """Тестовый endpoint для вебхука"""
+    return web.Response(
+        text="✅ Webhook endpoint is working\n"
+             "This endpoint receives Telegram updates",
+        status=200
+    )
 
-async def webhook_handler(request):
-    """Обработчик вебхуков от Telegram"""
-    # Проверяем секретный токен
-    if WEBHOOK_SECRET != "SECRET_TOKEN":
-        token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
-        if token != WEBHOOK_SECRET:
-            logger.warning(f"Invalid secret token: {token}")
-            return web.Response(status=403)
-    
-    try:
-        # Получаем обновление
-        update = await request.json()
-        
-        # Обрабатываем обновление
-        await dp.feed_update(bot=bot, update=update)
-        
-        return web.Response(text="OK")
-        
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        return web.Response(status=500)
-
-# ==================== WEB SERVER SETUP ====================
-
-async def on_startup(app: web.Application):
+async def on_startup():
     """Действия при запуске приложения"""
     logger.info("🚀 Starting Task Planner Bot...")
     
@@ -1392,7 +1321,7 @@ async def on_startup(app: web.Application):
             await bot.set_webhook(
                 url=WEBHOOK_URL,
                 drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=dp.resolve_used_update_types(),
                 secret_token=WEBHOOK_SECRET
             )
             logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
@@ -1401,15 +1330,13 @@ async def on_startup(app: web.Application):
             
     except Exception as e:
         logger.error(f"❌ Error setting webhook: {e}")
-        # Не прерываем запуск, бот будет работать в режиме polling при ошибке
-        logger.info("⚠️ Continuing without webhook, Telegram updates might not work")
+        raise
     
     logger.info("✅ Bot startup completed successfully")
-    logger.info(f"🌐 Server running on port {PORT}")
-    logger.info(f"📞 Health check: https://{RENDER_EXTERNAL_HOSTNAME}/health")
-    logger.info(f"🏠 Home page: https://{RENDER_EXTERNAL_HOSTNAME}/")
+    logger.info("📞 Webhook URL: " + WEBHOOK_URL)
+    logger.info("🌐 Health check: https://" + RENDER_EXTERNAL_HOSTNAME + "/health")
 
-async def on_shutdown(app: web.Application):
+async def on_shutdown():
     """Действия при остановке приложения"""
     logger.info("🛑 Shutting down...")
     
@@ -1425,55 +1352,34 @@ async def on_shutdown(app: web.Application):
     
     logger.info("✅ Bot shutdown completed")
 
-async def periodic_ping():
-    """Периодический пинг для поддержания активности"""
-    while True:
-        await asyncio.sleep(300)  # Каждые 5 минут
-        try:
-            # Пингуем сами себя
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f'https://{RENDER_EXTERNAL_HOSTNAME}/ping', timeout=10) as resp:
-                    if resp.status == 200:
-                        logger.info("🔄 Keep-alive ping successful")
-                    else:
-                        logger.warning(f"⚠️ Keep-alive ping failed: {resp.status}")
-        except Exception as e:
-            logger.warning(f"⚠️ Keep-alive ping error: {e}")
-
-def start_background_tasks(app):
-    """Запуск фоновых задач"""
-    # Запускаем периодический пинг
-    app['ping_task'] = asyncio.create_task(periodic_ping())
-
-async def cleanup_background_tasks(app):
-    """Очистка фоновых задач"""
-    app['ping_task'].cancel()
-    await app['ping_task']
-
 def main():
     """Основная функция запуска приложения"""
     # Создаем aiohttp приложение
     app = web.Application()
     
-    # Регистрируем обработчики
-    app.router.add_get('/', home_page)
-    app.router.add_get('/health', health_check)
-    app.router.add_get('/ping', ping_handler)
-    app.router.add_get('/info', info_handler)
-    app.router.add_post('/webhook', webhook_handler)
-    app.router.add_post('/set_webhook', set_webhook_handler)
-    app.router.add_post('/delete_webhook', delete_webhook_handler)
+    # Health check endpoints
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    app.router.add_get("/keep-alive", keep_alive_endpoint)
+    app.router.add_get("/webhook", handle_webhook_test)
     
-    # Настраиваем обработчики событий
-    app.on_startup.append(on_startup)
-    app.on_startup.append(start_background_tasks)
-    app.on_shutdown.append(on_shutdown)
-    app.on_shutdown.append(cleanup_background_tasks)
+    # Создаем обработчик вебхуков
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET
+    )
+    
+    # Регистрируем вебхук
+    webhook_handler.register(app, path="/webhook")
     
     # Запускаем приложение
     logger.info(f"🌐 Starting web server on port {PORT}")
     logger.info(f"📞 Webhook URL: {WEBHOOK_URL}")
-    logger.info(f"🔑 Webhook secret: {'Set' if WEBHOOK_SECRET != 'SECRET_TOKEN' else 'Using default'}")
+    logger.info(f"🔑 Webhook secret: {'Set' if WEBHOOK_SECRET else 'Not set'}")
+    
+    # Запускаем startup-функции
+    asyncio.run(on_startup())
     
     try:
         web.run_app(
@@ -1481,14 +1387,20 @@ def main():
             host="0.0.0.0",
             port=PORT,
             access_log=logger,
-            print=None
+            print=None  # Отключаем стандартное логирование aiohttp
         )
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down...")
     except Exception as e:
         logger.error(f"❌ Failed to start server: {e}")
         raise
-
-# Глобальная переменная времени запуска
-start_time = time.time()
+    finally:
+        # Запускаем shutdown-функции
+        asyncio.run(on_shutdown())
 
 if __name__ == "__main__":
+    # Глобальная переменная времени запуска
+    start_time = time.time()
+    
+    # Запускаем основное приложение
     main()
