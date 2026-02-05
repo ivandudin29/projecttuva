@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime, date
 from typing import Optional, List
 
@@ -14,22 +15,20 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Конфигурация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME") or "task-planner-bot.onrender.com"
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
-PORT = int(os.getenv("PORT", 10000))
 
-logger.info(f"Config loaded: BOT_TOKEN={BOT_TOKEN[:10]}...")
+logger.info(f"Config loaded: BOT_TOKEN present={bool(BOT_TOKEN)}")
+logger.info(f"DATABASE_URL present={bool(DATABASE_URL)}")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен")
@@ -58,7 +57,8 @@ class Database:
                 self.pool = await asyncpg.create_pool(
                     DATABASE_URL,
                     min_size=1,
-                    max_size=10
+                    max_size=10,
+                    command_timeout=60
                 )
                 await self.init_db()
                 logger.info("✅ Database connected successfully")
@@ -72,10 +72,6 @@ class Database:
         if self.pool:
             try:
                 async with self.pool.acquire() as conn:
-                    # Удаляем старые таблицы если они есть
-                    await conn.execute('DROP TABLE IF EXISTS tasks CASCADE')
-                    await conn.execute('DROP TABLE IF EXISTS projects CASCADE')
-                    
                     # Таблица проектов
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS projects (
@@ -105,7 +101,7 @@ class Database:
                     await conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline)')
                     await conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
                     
-                    logger.info("✅ Database tables reinitialized")
+                    logger.info("✅ Database tables initialized")
             except Exception as e:
                 logger.error(f"❌ Database init error: {e}")
     
@@ -832,63 +828,16 @@ async def handle_other_messages(message: Message):
         reply_markup=get_main_keyboard()
     )
 
-# Health check endpoint
-async def health_check(request):
-    """Проверка работоспособности"""
-    return web.Response(text="OK")
-
-async def on_startup(app: web.Application):
-    """Действия при запуске"""
-    logger.info("Starting up...")
+async def main():
+    """Основная асинхронная функция"""
+    logger.info("Starting bot...")
     
-    # Подключение к БД
+    # Подключаемся к БД
     await db.connect()
     
-    # Установка webhook
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"]
-    )
-    
-    logger.info(f"Webhook set to: {WEBHOOK_URL}")
-
-async def on_shutdown(app: web.Application):
-    """Действия при остановке"""
-    logger.info("Shutting down...")
-    
-    # Удаление webhook
-    await bot.delete_webhook()
-    
-    # Закрытие соединения с БД
-    await db.close()
-    
-    logger.info("Bot stopped successfully")
-
-def main():
-    """Основная функция запуска"""
-    app = web.Application()
-    
-    # Health check endpoints
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-    
-    # Создаем обработчик вебхуков
-    webhook_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot
-    )
-    
-    # Регистрируем вебхук
-    webhook_handler.register(app, path=WEBHOOK_PATH)
-    
-    # Настраиваем события запуска/остановки
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    
-    # Запускаем приложение
-    logger.info(f"Starting server on port {PORT}")
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    # Запускаем polling
+    logger.info("Bot started. Polling...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
