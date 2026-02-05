@@ -1300,7 +1300,7 @@ async def handle_webhook_test(request):
         status=200
     )
 
-async def on_startup():
+async def on_startup(app=None):
     """Действия при запуске приложения"""
     logger.info("🚀 Starting Task Planner Bot...")
     
@@ -1334,7 +1334,7 @@ async def on_startup():
     logger.info("📞 Webhook URL: " + WEBHOOK_URL)
     logger.info("🌐 Health check: https://" + RENDER_EXTERNAL_HOSTNAME + "/health")
 
-async def on_shutdown():
+async def on_shutdown(app=None):
     """Действия при остановке приложения"""
     logger.info("🛑 Shutting down...")
     
