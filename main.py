@@ -9,7 +9,6 @@ import logging
 import asyncio
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
-from threading import Thread
 import time
 
 import asyncpg
@@ -28,7 +27,6 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiohttp import web
-import aiohttp
 
 # ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -603,7 +601,7 @@ async def cmd_help(message: Message):
         
         "<b>Управление проектами:</b>\n"
         "• <b>➕ Новый проект</b> - создать проект\n"
-        "• <b>📂 Мои проекты</b> - список проектов\n"
+        "• <b>📂 Мои проекта</b> - список проектов\n"
         "• В проекте можно добавлять, удалять и отмечать задачи\n\n"
         
         "<b>Управление задачами:</b>\n"
@@ -1352,8 +1350,8 @@ async def on_shutdown():
     
     logger.info("✅ Bot shutdown completed")
 
-def main():
-    """Основная функция запуска приложения"""
+async def create_app():
+    """Создание и настройка приложения"""
     # Создаем aiohttp приложение
     app = web.Application()
     
@@ -1373,13 +1371,25 @@ def main():
     # Регистрируем вебхук
     webhook_handler.register(app, path="/webhook")
     
+    # Настраиваем startup и shutdown
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    return app
+
+def main():
+    """Основная функция запуска приложения"""
+    # Создаем event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     # Запускаем приложение
     logger.info(f"🌐 Starting web server on port {PORT}")
     logger.info(f"📞 Webhook URL: {WEBHOOK_URL}")
     logger.info(f"🔑 Webhook secret: {'Set' if WEBHOOK_SECRET else 'Not set'}")
     
-    # Запускаем startup-функции
-    asyncio.run(on_startup())
+    # Создаем и запускаем приложение
+    app = loop.run_until_complete(create_app())
     
     try:
         web.run_app(
@@ -1394,9 +1404,6 @@ def main():
     except Exception as e:
         logger.error(f"❌ Failed to start server: {e}")
         raise
-    finally:
-        # Запускаем shutdown-функции
-        asyncio.run(on_shutdown())
 
 if __name__ == "__main__":
     # Глобальная переменная времени запуска
