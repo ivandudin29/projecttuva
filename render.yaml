@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: telegram-task-bot
+    name: task-planner-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
