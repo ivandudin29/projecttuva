@@ -11,11 +11,6 @@ services:
         fromDatabase:
           name: taskbotdb
           property: connectionString
-      - key: WEBHOOK_URL
-        fromService:
-          name: telegram-task-bot
-          type: web
-          property: url
       - key: PORT
         value: 10000
     healthCheckPath: /health
