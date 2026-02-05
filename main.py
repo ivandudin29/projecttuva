@@ -924,10 +924,11 @@ async def show_tasks(callback: CallbackQuery):
             if len(task['title']) > 15:
                 task_title += "..."
             
+            # ИСПРАВЛЕНО: Используем правильный формат callback_data
             keyboard_buttons.append([
                 InlineKeyboardButton(
                     text=f"✅ {task_title}",
-                    callback_data=f"task_toggle_{task['id']}"
+                    callback_data=f"task_toggle_{task['id']}_{project_id}"  # Добавляем project_id для удобства
                 )
             ])
         
@@ -1092,17 +1093,24 @@ async def add_task_deadline(message: Message, state: FSMContext):
     await state.clear()
 
 @router.callback_query(F.data.startswith("task_toggle_"))
-async def toggle_task_status(callback: CallbackQuery):
+async def toggle_task_status_handler(callback: CallbackQuery):
     """Переключение статуса задачи"""
     try:
-        task_id = int(callback.data.split("_")[2])
+        # ИСПРАВЛЕНО: Правильно парсим callback_data
+        parts = callback.data.split("_")
+        task_id = int(parts[2])
+        project_id = int(parts[3]) if len(parts) > 3 else None
+        
         task = await db.get_task_by_id(task_id)
         
         if not task:
             await callback.answer("❌ Задача не найдена.")
             return
         
-        project = await db.get_project_by_id(task['project_id'])
+        if project_id:
+            project = await db.get_project_by_id(project_id)
+        else:
+            project = await db.get_project_by_id(task['project_id'])
         
         if not project or project['user_id'] != callback.from_user.id:
             await callback.answer("❌ Доступ запрещен.")
@@ -1114,8 +1122,9 @@ async def toggle_task_status(callback: CallbackQuery):
             new_status = "✅ выполнена" if task['status'] == 'active' else "🔄 активна"
             await callback.answer(f"Задача отмечена как {new_status}!")
             
-            # Обновляем список задач
-            await show_tasks(callback)
+            # Обновляем список задач, если известен project_id
+            if project_id:
+                await show_tasks(callback)
         else:
             await callback.answer("❌ Не удалось обновить задачу.")
     
