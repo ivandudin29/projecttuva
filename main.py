@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Task Planner Bot - Telegram бот для управления проектами и задачами
-Версия для развертывания на Render с использованием webhook
+Версия для развертывания на Render с использованием webhook и keep-alive
 """
 
 import os
@@ -9,6 +9,8 @@ import logging
 import asyncio
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
+from threading import Thread
+import time
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router, F, html
@@ -26,6 +28,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiohttp import web
+from flask import Flask, jsonify  # Добавили Flask для keep-alive
 
 # ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -65,6 +68,42 @@ logger.info("=" * 50)
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен! Создайте бота через @BotFather и установите токен.")
+
+# ==================== FLASK SERVER FOR KEEP-ALIVE ====================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "Task Planner Telegram Bot",
+        "webhook": WEBHOOK_URL,
+        "timestamp": datetime.now().isoformat()
+    })
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@flask_app.route('/ping')
+def ping():
+    return "pong"
+
+@flask_app.route('/info')
+def info():
+    return jsonify({
+        "bot": "Task Planner Bot",
+        "database": "Connected" if DATABASE_URL else "Not configured",
+        "webhook_set": True,
+        "uptime": time.time() - start_time
+    })
+
+def run_flask_app():
+    """Запуск Flask сервера в отдельном потоке"""
+    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+
+# Глобальная переменная времени запуска
+start_time = time.time()
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
 # Инициализация бота с настройками по умолчанию
@@ -133,10 +172,6 @@ class Database:
         
         try:
             async with self.pool.acquire() as conn:
-                # Удаляем существующие таблицы, если нужно начать с чистого листа
-                # await conn.execute('DROP TABLE IF EXISTS tasks CASCADE')
-                # await conn.execute('DROP TABLE IF EXISTS projects CASCADE')
-                
                 # Таблица проектов - добавляем updated_at
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS projects (
@@ -924,11 +959,10 @@ async def show_tasks(callback: CallbackQuery):
             if len(task['title']) > 15:
                 task_title += "..."
             
-            # ИСПРАВЛЕНО: Используем правильный формат callback_data
             keyboard_buttons.append([
                 InlineKeyboardButton(
                     text=f"✅ {task_title}",
-                    callback_data=f"task_toggle_{task['id']}_{project_id}"  # Добавляем project_id для удобства
+                    callback_data=f"toggle_task_{task['id']}_{project_id}"
                 )
             ])
         
@@ -1092,14 +1126,13 @@ async def add_task_deadline(message: Message, state: FSMContext):
     
     await state.clear()
 
-@router.callback_query(F.data.startswith("task_toggle_"))
+@router.callback_query(F.data.startswith("toggle_task_"))
 async def toggle_task_status_handler(callback: CallbackQuery):
     """Переключение статуса задачи"""
     try:
-        # ИСПРАВЛЕНО: Правильно парсим callback_data
         parts = callback.data.split("_")
         task_id = int(parts[2])
-        project_id = int(parts[3]) if len(parts) > 3 else None
+        project_id = int(parts[3])
         
         task = await db.get_task_by_id(task_id)
         
@@ -1107,10 +1140,7 @@ async def toggle_task_status_handler(callback: CallbackQuery):
             await callback.answer("❌ Задача не найдена.")
             return
         
-        if project_id:
-            project = await db.get_project_by_id(project_id)
-        else:
-            project = await db.get_project_by_id(task['project_id'])
+        project = await db.get_project_by_id(project_id)
         
         if not project or project['user_id'] != callback.from_user.id:
             await callback.answer("❌ Доступ запрещен.")
@@ -1122,9 +1152,8 @@ async def toggle_task_status_handler(callback: CallbackQuery):
             new_status = "✅ выполнена" if task['status'] == 'active' else "🔄 активна"
             await callback.answer(f"Задача отмечена как {new_status}!")
             
-            # Обновляем список задач, если известен project_id
-            if project_id:
-                await show_tasks(callback)
+            # Обновляем список задач
+            await show_tasks(callback)
         else:
             await callback.answer("❌ Не удалось обновить задачу.")
     
@@ -1269,7 +1298,9 @@ async def health_check(request):
             return web.Response(
                 text="✅ OK - Bot is running\n"
                      f"Database: {'Connected' if DATABASE_URL else 'Not configured'}\n"
-                     f"Webhook: {WEBHOOK_URL}",
+                     f"Webhook: {WEBHOOK_URL}\n"
+                     f"Flask server: Running on port 8080\n"
+                     f"Uptime: {time.time() - start_time:.0f} seconds",
                 status=200
             )
         else:
@@ -1284,6 +1315,22 @@ async def health_check(request):
             status=500
         )
 
+async def keep_alive_endpoint(request):
+    """Endpoint для поддержания приложения активным"""
+    try:
+        # Простая проверка, возвращаем OK
+        return web.Response(
+            text="✅ Keep-alive endpoint is working\n"
+                 f"Timestamp: {datetime.now().isoformat()}\n"
+                 f"Bot is alive and responding",
+            status=200
+        )
+    except Exception as e:
+        return web.Response(
+            text=f"❌ Error: {str(e)}",
+            status=500
+        )
+
 async def handle_webhook_test(request):
     """Тестовый endpoint для вебхука"""
     return web.Response(
@@ -1295,6 +1342,11 @@ async def handle_webhook_test(request):
 async def on_startup(app: web.Application):
     """Действия при запуске приложения"""
     logger.info("🚀 Starting Task Planner Bot...")
+    
+    # Запускаем Flask сервер в отдельном потоке
+    flask_thread = Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask keep-alive server started on port 8080")
     
     # Подключение к базе данных
     if DATABASE_URL:
@@ -1323,6 +1375,9 @@ async def on_startup(app: web.Application):
         raise
     
     logger.info("✅ Bot startup completed successfully")
+    logger.info("📞 Webhook URL: " + WEBHOOK_URL)
+    logger.info("🌐 Health check: https://" + RENDER_EXTERNAL_HOSTNAME + "/health")
+    logger.info("🔥 Keep-alive: https://" + RENDER_EXTERNAL_HOSTNAME + ":8080/")
 
 async def on_shutdown(app: web.Application):
     """Действия при остановке приложения"""
@@ -1351,6 +1406,7 @@ def main():
     # Health check endpoints
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+    app.router.add_get("/keep-alive", keep_alive_endpoint)
     app.router.add_get("/webhook", handle_webhook_test)
     
     # Создаем обработчик вебхуков
@@ -1385,4 +1441,8 @@ def main():
         raise
 
 if __name__ == "__main__":
+    # Импортируем aiohttp здесь, чтобы избежать циклического импорта
+    import aiohttp
+    
+    # Запускаем основное приложение
     main()
