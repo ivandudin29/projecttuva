@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from datetime import datetime, date
 from typing import Optional, List
 
@@ -15,6 +14,8 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 # Настройка логирования
 logging.basicConfig(
@@ -27,8 +28,15 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Webhook настройки
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME", "task-planner-bot.onrender.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
+PORT = int(os.getenv("PORT", 10000))
+
 logger.info(f"Config loaded: BOT_TOKEN present={bool(BOT_TOKEN)}")
-logger.info(f"DATABASE_URL present={bool(DATABASE_URL)}")
+logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+logger.info(f"PORT: {PORT}")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен")
@@ -828,16 +836,80 @@ async def handle_other_messages(message: Message):
         reply_markup=get_main_keyboard()
     )
 
-async def main():
-    """Основная асинхронная функция"""
-    logger.info("Starting bot...")
+# Health check endpoint
+async def health_check(request):
+    """Проверка работоспособности"""
+    return web.Response(text="OK", status=200)
+
+async def handle_webhook(request):
+    """Обработчик вебхука для проверки"""
+    return web.Response(text="Webhook is working")
+
+async def on_startup(app: web.Application):
+    """Действия при запуске"""
+    logger.info("Starting up...")
     
-    # Подключаемся к БД
+    # Подключение к БД
     await db.connect()
     
-    # Запускаем polling
-    logger.info("Bot started. Polling...")
-    await dp.start_polling(bot)
+    # Установка webhook
+    try:
+        await bot.set_webhook(
+            url=WEBHOOK_URL,
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"]
+        )
+        logger.info(f"Webhook set to: {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+
+async def on_shutdown(app: web.Application):
+    """Действия при остановке"""
+    logger.info("Shutting down...")
+    
+    # Удаление webhook
+    try:
+        await bot.delete_webhook()
+        logger.info("Webhook deleted")
+    except Exception as e:
+        logger.error(f"Error deleting webhook: {e}")
+    
+    # Закрытие соединения с БД
+    await db.close()
+    
+    logger.info("Bot stopped successfully")
+
+def main():
+    """Основная функция запуска"""
+    app = web.Application()
+    
+    # Health check endpoints
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    app.router.add_get("/webhook", handle_webhook)
+    
+    # Создаем обработчик вебхуков
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token="SECRET_TOKEN"
+    )
+    
+    # Регистрируем вебхук
+    webhook_handler.register(app, path="/webhook")
+    
+    # Настраиваем события запуска/остановки
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Запускаем приложение
+    logger.info(f"Starting server on port {PORT}")
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        access_log=logger
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
