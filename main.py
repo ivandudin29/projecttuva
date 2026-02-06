@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -48,8 +49,11 @@ logger.info(f"• PORT: {PORT}")
 logger.info(f"• WEBHOOK_URL: {WEBHOOK_URL}")
 logger.info(f"• DATABASE_URL: {'Установлен' if DATABASE_URL else 'НЕТ!'}")
 
-# Инициализация
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+# Инициализация (исправлено для aiogram 3.7.0+)
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 # Подключение к базе данных
