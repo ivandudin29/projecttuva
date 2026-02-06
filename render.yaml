@@ -1,15 +1,15 @@
 services:
   - type: web
-    name: task-planner-bot
+    name: telegram-bot
     env: python
-    region: frankfurt  # или другой регион ближе к вам
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
-    healthCheckPath: /health
-    autoDeploy: true
+      - key: WEBHOOK_URL
+        sync: false
+      - key: RENDER
+        value: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
