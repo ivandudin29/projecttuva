@@ -1,172 +1,114 @@
-import asyncio
-import logging
-import sys
 import os
-from typing import Optional
-
-from aiogram import Bot, Dispatcher, Router, types
+import logging
+from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Конфигурация
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH if os.getenv("WEBHOOK_URL") else None
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", 8080))
+if not TOKEN:
+    logger.error("❌ BOT_TOKEN не установлен!")
+    raise ValueError("Установите BOT_TOKEN в переменных окружения")
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
-logger = logging.getLogger(__name__)
+WEBHOOK_URL = f"https://task-planner-bot.onrender.com/webhook"
+PORT = int(os.getenv("PORT", 8080))
 
 # Инициализация
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
-# Статистика бота
-bot_stats = {
-    "start_count": 0,
-    "total_messages": 0
-}
-
-@router.message(CommandStart())
-async def command_start_handler(message: Message) -> None:
-    """Обработчик команды /start"""
-    bot_stats["start_count"] += 1
-    bot_stats["total_messages"] += 1
-    
-    user = message.from_user
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
     await message.answer(
-        f"👋 Привет, {user.first_name}!\n\n"
-        f"Я тестовый бот для отладки инфраструктуры.\n"
-        f"Статистика бота:\n"
-        f"• Запусков: {bot_stats['start_count']}\n"
-        f"• Всего сообщений: {bot_stats['total_messages']}\n\n"
-        f"Команды:\n"
-        f"/start - Начальное сообщение\n"
-        f"/ping - Проверка работы бота\n"
-        f"/stats - Статистика\n"
-        f"/id - Получить ID чата"
+        "✅ Бот работает!\n"
+        f"Ваш ID: {message.from_user.id}\n"
+        "Команды:\n"
+        "/ping - проверка\n"
+        "/id - ваш ID"
     )
+    logger.info(f"Пользователь {message.from_user.id} запустил бота")
 
-@router.message(Command("ping"))
-async def ping_handler(message: Message) -> None:
-    """Обработчик команды /ping"""
-    bot_stats["total_messages"] += 1
-    await message.answer("🏓 Pong! Бот работает корректно.")
+@dp.message(Command("ping"))
+async def cmd_ping(message: Message):
+    await message.answer("🏓 Pong!")
+    logger.info(f"Ping от {message.from_user.id}")
 
-@router.message(Command("stats"))
-async def stats_handler(message: Message) -> None:
-    """Обработчик команды /stats"""
-    bot_stats["total_messages"] += 1
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
     await message.answer(
-        f"📊 Статистика бота:\n"
-        f"• Запусков: {bot_stats['start_count']}\n"
-        f"• Всего сообщений: {bot_stats['total_messages']}\n"
-        f"• ID чата: {message.chat.id}"
-    )
-
-@router.message(Command("id"))
-async def id_handler(message: Message) -> None:
-    """Обработчик команды /id"""
-    bot_stats["total_messages"] += 1
-    await message.answer(
-        f"📋 Информация о чате:\n"
-        f"• ID чата: `{message.chat.id}`\n"
-        f"• Тип чата: {message.chat.type}\n"
-        f"• Ваш ID: `{message.from_user.id}`",
+        f"👤 Ваш ID: `{message.from_user.id}`\n"
+        f"💬 ID чата: `{message.chat.id}`",
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
-@router.message()
-async def echo_handler(message: Message) -> None:
-    """Эхо-обработчик для всех сообщений"""
-    bot_stats["total_messages"] += 1
-    try:
-        await message.answer(f"Эхо: {message.text}")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке эхо: {e}")
+@dp.message()
+async def echo(message: Message):
+    await message.answer(f"Вы сказали: {message.text}")
 
-async def on_startup(bot: Bot) -> None:
-    """Действия при запуске бота"""
-    logger.info("Бот запускается...")
+async def on_startup():
+    """Установка вебхука при запуске"""
+    webhook_url = f"{WEBHOOK_URL}"
     
-    if WEBHOOK_URL:
-        # Установка вебхука
-        await bot.set_webhook(
-            url=WEBHOOK_URL,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types()
-        )
-        logger.info(f"Вебхук установлен: {WEBHOOK_URL}")
-    else:
-        logger.info("Режим поллинга")
+    # Удаляем старый вебхук
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Устанавливаем новый
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types()
+    )
+    
+    logger.info(f"✅ Вебхук установлен: {webhook_url}")
+    
+    # Проверяем
+    webhook_info = await bot.get_webhook_info()
+    logger.info(f"Информация о вебхуке: {webhook_info.url}")
 
-async def on_shutdown(bot: Bot) -> None:
-    """Действия при остановке бота"""
-    logger.info("Бот останавливается...")
-    
-    if WEBHOOK_URL:
-        # Удаление вебхука
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Вебхук удален")
-    
+async def on_shutdown():
+    """Очистка при выключении"""
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.session.close()
-    logger.info("Сессия закрыта")
+    logger.info("Бот остановлен")
 
-async def main() -> None:
-    """Основная функция запуска бота"""
-    logger.info(f"Запуск бота на порту {PORT}")
+async def health_check(request):
+    """Проверка здоровья"""
+    return web.Response(text="Bot is running")
+
+def main():
+    """Запуск приложения"""
+    logger.info(f"🚀 Запуск бота на порту {PORT}")
     
-    # Подключаем обработчики запуска/остановки
+    # Регистрируем обработчики
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
     
-    if WEBHOOK_URL and os.getenv("RENDER"):
-        # Режим вебхука (для Render)
-        app = web.Application()
-        webhook_requests_handler = SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-        )
-        webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-        
-        # Настраиваем CORS (опционально)
-        async def health_check(request):
-            return web.Response(text="Bot is running")
-        
-        app.router.add_get("/health", health_check)
-        
-        setup_application(app, dp, bot=bot)
-        
-        logger.info(f"Запуск веб-сервера на {HOST}:{PORT}")
-        await web._run_app(app, host=HOST, port=PORT)
-    else:
-        # Режим поллинга (для локальной разработки)
-        logger.info("Запуск в режиме поллинга...")
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+    # Создаем веб-приложение
+    app = web.Application()
+    
+    # Регистрируем вебхук
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_handler.register(app, path="/webhook")
+    
+    # Добавляем health check
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    # Настраиваем приложение
+    setup_application(app, dp, bot=bot)
+    
+    # Запускаем сервер
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    # Проверка наличия токена
-    if not TOKEN:
-        logger.error("Токен бота не найден! Установите переменную BOT_TOKEN")
-        sys.exit(1)
-    
-    # Запуск бота
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен")
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-        sys.exit(1)
+    main()
