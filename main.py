@@ -3,6 +3,7 @@ import logging
 import sys
 from datetime import datetime
 import asyncio
+import traceback
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -53,7 +54,7 @@ logger.info(f"• WEBHOOK_HOST: {WEBHOOK_HOST}")
 logger.info(f"• WEBHOOK_URL: {WEBHOOK_URL}")
 logger.info(f"• DATABASE_URL: {'Установлен' if DATABASE_URL else 'НЕТ!'}")
 
-# Инициализация (исправлено для aiogram 3.7.0+)
+# Инициализация
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -82,74 +83,53 @@ async def get_db_pool():
             raise
     return db_pool
 
-# Создание таблиц если их нет
-async def create_tables():
-    """Создание таблиц projects и tasks если они не существуют"""
-    try:
-        logger.info("🔄 Проверка/создание таблиц...")
-        pool = await get_db_pool()
-        if not pool:
-            logger.error("❌ Не удалось получить пул подключений")
-            return False
-            
-        async with pool.acquire() as conn:
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS projects (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    name VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id SERIAL PRIMARY KEY,
-                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    title VARCHAR(255) NOT NULL,
-                    deadline DATE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            logger.info("✅ Таблицы созданы или уже существуют")
-            return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка при создании таблиц: {e}")
-        return False
+# Простые хендлеры для теста
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    logger.info(f"Получен /start от пользователя {message.from_user.id}")
+    await message.answer(
+        "🎉 Добро пожаловать в менеджер проектов!\n\n"
+        "Выберите действие:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="➕ Проект"), KeyboardButton(text="📂 Проекты")]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=False
+        )
+    )
 
-# ... (остальной код с хендлерами остается таким же как в предыдущей версии) ...
+@dp.message(Command("ping"))
+async def cmd_ping(message: Message):
+    logger.info(f"Получен /ping от пользователя {message.from_user.id}")
+    await message.answer("🏓 Pong! Бот жив и работает")
 
-# Простая команда для теста
 @dp.message(Command("test"))
 async def cmd_test(message: Message):
-    """Простая тестовая команда для проверки работы бота"""
+    logger.info(f"Получен /test от пользователя {message.from_user.id}")
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             count = await conn.fetchval('SELECT COUNT(*) FROM projects')
         await message.answer(f"✅ Бот работает! Проектов в базе: {count}")
     except Exception as e:
-        await message.answer(f"❌ Ошибка при работе с базой: {str(e)[:100]}")
+        logger.error(f"Ошибка в /test: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
-@dp.message(Command("dbcheck"))
-async def cmd_dbcheck(message: Message):
-    """Проверка подключения к базе данных"""
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            version = await conn.fetchval('SELECT version()')
-            projects_count = await conn.fetchval('SELECT COUNT(*) FROM projects')
-            tasks_count = await conn.fetchval('SELECT COUNT(*) FROM tasks')
-        
-        await message.answer(
-            f"✅ База данных работает!\n"
-            f"📊 PostgreSQL: {version.split()[0]}\n"
-            f"📁 Проектов: {projects_count}\n"
-            f"📝 Задач: {tasks_count}"
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка подключения к базе: {str(e)[:200]}")
+@dp.message(Command("echo"))
+async def cmd_echo(message: Message):
+    logger.info(f"Получен echo: {message.text}")
+    await message.answer(f"Эхо: {message.text}")
+
+@dp.message(F.text == "➕ Проект")
+async def test_button(message: Message):
+    logger.info(f"Нажата кнопка '➕ Проект' от {message.from_user.id}")
+    await message.answer("Тестовая кнопка работает! Для создания проекта используйте команду /newproject")
+
+@dp.message(F.text == "📂 Проекты")
+async def test_button2(message: Message):
+    logger.info(f"Нажата кнопка '📂 Проекты' от {message.from_user.id}")
+    await message.answer("Тестовая кнопка работает! Для просмотра проектов используйте команду /listprojects")
 
 # Webhook логика
 async def on_startup(bot: Bot):
@@ -157,14 +137,13 @@ async def on_startup(bot: Bot):
     logger.info("🔄 Установка вебхука...")
     
     try:
-        # Создаем таблицы
-        success = await create_tables()
-        if not success:
-            logger.error("❌ Не удалось создать таблицы")
-            # Не выходим, возможно таблицы уже созданы
-            
         # Даем время на инициализацию
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
+        
+        # Получаем информацию о текущем вебхуке
+        current_webhook = await bot.get_webhook_info()
+        logger.info(f"Текущий вебхук: {current_webhook.url}")
+        logger.info(f"Ожидающих обновлений: {current_webhook.pending_update_count}")
         
         # Удаляем старый вебхук
         await bot.delete_webhook(drop_pending_updates=True)
@@ -180,11 +159,12 @@ async def on_startup(bot: Bot):
         
         # Проверяем
         webhook_info = await bot.get_webhook_info()
-        logger.info(f"Информация о вебхуке: {webhook_info.url}")
-        logger.info(f"Ожидающих обновлений: {webhook_info.pending_update_count}")
+        logger.info(f"✅ Информация о вебхуке: {webhook_info.url}")
+        logger.info(f"✅ Ожидающих обновлений: {webhook_info.pending_update_count}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка при установке вебхука: {e}")
+        logger.error(traceback.format_exc())
 
 async def on_shutdown(bot: Bot):
     """Очистка при выключении"""
@@ -201,10 +181,7 @@ async def on_shutdown(bot: Bot):
 async def health_check(request):
     """Health check для Render"""
     try:
-        # Проверяем подключение к базе
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.fetchval('SELECT 1')
+        # Простая проверка без базы данных
         return web.Response(
             text="OK",
             status=200,
@@ -213,7 +190,7 @@ async def health_check(request):
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return web.Response(
-            text="DATABASE ERROR",
+            text="ERROR",
             status=503,
             headers={"Content-Type": "text/plain"}
         )
@@ -230,17 +207,60 @@ async def webhook_info_page(request):
             <p><strong>Webhook URL:</strong> {info.url or 'Not set'}</p>
             <p><strong>Pending Updates:</strong> {info.pending_update_count}</p>
             <p><strong>Last Error:</strong> {info.last_error_message or 'None'}</p>
+            <p><strong>Last Error Date:</strong> {info.last_error_date or 'None'}</p>
+            <p><strong>Max Connections:</strong> {info.max_connections or 'Not set'}</p>
             <p><strong>Service URL:</strong> https://{WEBHOOK_HOST}</p>
             <hr>
             <p>Health check: <a href="/health">/health</a></p>
             <p>Webhook endpoint: <a href="/webhook">/webhook</a></p>
             <p>Status page: <a href="/status">/status</a></p>
+            <p>Test links:</p>
+            <ul>
+                <li><a href="/test">/test</a> - Простой тест</li>
+                <li><a href="/debug">/debug</a> - Отладка</li>
+            </ul>
         </body>
         </html>
         """
         return web.Response(text=html, content_type="text/html")
     except Exception as e:
-        return web.Response(text=f"Error: {e}", status=500)
+        logger.error(f"Ошибка в webhook_info_page: {e}")
+        return web.Response(text=f"Error getting webhook info: {e}", status=500)
+
+async def test_page(request):
+    """Тестовая страница"""
+    return web.Response(
+        text="Test page is working!",
+        status=200,
+        headers={"Content-Type": "text/plain"}
+    )
+
+async def debug_page(request):
+    """Страница отладки"""
+    debug_info = f"""
+    Debug Information:
+    - TOKEN: {'SET' if TOKEN else 'NOT SET'}
+    - DATABASE_URL: {'SET' if DATABASE_URL else 'NOT SET'}
+    - WEBHOOK_HOST: {WEBHOOK_HOST}
+    - WEBHOOK_URL: {WEBHOOK_URL}
+    - PORT: {PORT}
+    """
+    return web.Response(
+        text=debug_info,
+        status=200,
+        headers={"Content-Type": "text/plain"}
+    )
+
+async def handle_webhook(request):
+    """Обработчик вебхука вручную для отладки"""
+    logger.info("Получен запрос на /webhook")
+    try:
+        data = await request.json()
+        logger.info(f"Данные вебхука: {data}")
+        return web.Response(text="OK", status=200)
+    except Exception as e:
+        logger.error(f"Ошибка в handle_webhook: {e}")
+        return web.Response(text="ERROR", status=500)
 
 def main():
     """Запуск приложения"""
@@ -253,7 +273,7 @@ def main():
     # Создаем веб-приложение
     app = web.Application()
     
-    # Регистрируем вебхук
+    # Регистрируем вебхук через SimpleRequestHandler
     webhook_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -264,6 +284,8 @@ def main():
     app.router.add_get("/", webhook_info_page)
     app.router.add_get("/health", health_check)
     app.router.add_get("/status", webhook_info_page)
+    app.router.add_get("/test", test_page)
+    app.router.add_get("/debug", debug_page)
     
     # Настраиваем приложение
     setup_application(app, dp, bot=bot)
@@ -275,12 +297,13 @@ def main():
     try:
         web.run_app(
             app,
-            host="0.0.0.0",  # Важно: слушаем все интерфейсы
+            host="0.0.0.0",
             port=PORT,
-            access_log=None  # Отключаем access логи чтобы не засорять
+            access_log=None
         )
     except Exception as e:
         logger.error(f"❌ Ошибка при запуске сервера: {e}")
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":
