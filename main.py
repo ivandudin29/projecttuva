@@ -1,9 +1,8 @@
 import os
+import asyncio
 import logging
 import sys
 from datetime import datetime
-import asyncio
-import traceback
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -16,8 +15,6 @@ from aiogram.types import (
     KeyboardButton, InlineKeyboardMarkup,
     InlineKeyboardButton, CallbackQuery
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
 import asyncpg
 
 # Настройка логирования
@@ -38,21 +35,7 @@ if not DATABASE_URL:
     logger.error("❌ DATABASE_URL не найден!")
     sys.exit(1)
 
-# Render автоматически устанавливает PORT (обычно 10000)
-PORT = int(os.getenv("PORT", 8080))
-# Для Render нужно использовать их домен
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-if not WEBHOOK_HOST:
-    logger.error("❌ RENDER_EXTERNAL_HOSTNAME не найден!")
-    sys.exit(1)
-
-WEBHOOK_URL = f"https://{WEBHOOK_HOST}/webhook"
-
-logger.info(f"🚀 Конфигурация:")
-logger.info(f"• PORT: {PORT}")
-logger.info(f"• WEBHOOK_HOST: {WEBHOOK_HOST}")
-logger.info(f"• WEBHOOK_URL: {WEBHOOK_URL}")
-logger.info(f"• DATABASE_URL: {'Установлен' if DATABASE_URL else 'НЕТ!'}")
+logger.info("🚀 Инициализация бота...")
 
 # Инициализация
 bot = Bot(
@@ -61,250 +44,358 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Глобальный пул подключений
-db_pool = None
-
+# Подключение к базе данных
 async def get_db_pool():
     """Создание пула подключений к PostgreSQL"""
-    global db_pool
-    if db_pool is None:
-        try:
-            logger.info("🔄 Создание пула подключений к PostgreSQL...")
-            db_pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=1,
-                max_size=10,
-                command_timeout=60,
-                server_settings={'search_path': 'public'}
-            )
-            logger.info("✅ Пул подключений создан")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при создании пула подключений: {e}")
-            raise
-    return db_pool
+    try:
+        logger.info("🔄 Подключение к PostgreSQL...")
+        pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            command_timeout=60
+        )
+        logger.info("✅ Подключено к PostgreSQL")
+        return pool
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+        return None
 
-# Простые хендлеры для теста
+# Создание таблиц если их нет
+async def create_tables():
+    """Создание таблиц projects и tasks если они не существуют"""
+    try:
+        logger.info("🔄 Проверка таблиц...")
+        pool = await get_db_pool()
+        if not pool:
+            return False
+            
+        async with pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS projects (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title VARCHAR(255) NOT NULL,
+                    deadline DATE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            logger.info("✅ Таблицы готовы")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка при создании таблиц: {e}")
+        return False
+
+# FSM States
+class ProjectState(StatesGroup):
+    waiting_for_name = State()
+
+class TaskState(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_deadline = State()
+
+# Reply клавиатура для главного меню
+def get_main_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Проект"), KeyboardButton(text="📂 Проекты")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    return keyboard
+
+# Inline клавиатура для проекта
+def get_project_keyboard(project_id: int):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Задачи", callback_data=f"tasks:{project_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{project_id}")
+            ]
+        ]
+    )
+    return keyboard
+
+# Inline клавиатура для задач
+def get_tasks_keyboard(project_id: int):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить задачу", callback_data=f"add_task:{project_id}")]
+        ]
+    )
+    return keyboard
+
+# Хендлеры
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    logger.info(f"Получен /start от пользователя {message.from_user.id}")
+    logger.info(f"📨 /start от {message.from_user.id}")
     await message.answer(
         "🎉 Добро пожаловать в менеджер проектов!\n\n"
         "Выберите действие:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="➕ Проект"), KeyboardButton(text="📂 Проекты")]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=False
-        )
+        reply_markup=get_main_keyboard()
     )
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: Message):
-    logger.info(f"Получен /ping от пользователя {message.from_user.id}")
+    logger.info(f"🏓 /ping от {message.from_user.id}")
     await message.answer("🏓 Pong! Бот жив и работает")
 
 @dp.message(Command("test"))
 async def cmd_test(message: Message):
-    logger.info(f"Получен /test от пользователя {message.from_user.id}")
+    logger.info(f"🧪 /test от {message.from_user.id}")
+    await message.answer("✅ Тест пройден! Бот работает!")
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    logger.info(f"🆔 /id от {message.from_user.id}")
+    await message.answer(f"Ваш ID: {message.from_user.id}")
+
+# Создание проекта
+@dp.message(F.text == "➕ Проект")
+async def start_create_project(message: Message, state: FSMContext):
+    logger.info(f"📝 Создание проекта от {message.from_user.id}")
+    await message.answer("Введите название проекта:")
+    await state.set_state(ProjectState.waiting_for_name)
+
+@dp.message(ProjectState.waiting_for_name)
+async def process_project_name(message: Message, state: FSMContext):
+    project_name = message.text.strip()
+    
+    if not project_name:
+        await message.answer("Название проекта не может быть пустым. Попробуйте еще раз:")
+        return
+    
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            count = await conn.fetchval('SELECT COUNT(*) FROM projects')
-        await message.answer(f"✅ Бот работает! Проектов в базе: {count}")
+            await conn.execute(
+                "INSERT INTO projects (user_id, name) VALUES ($1, $2)",
+                message.from_user.id, project_name
+            )
+        
+        await message.answer(f"✅ Проект '{project_name}' создан!", reply_markup=get_main_keyboard())
+        logger.info(f"✅ Проект создан: {project_name}")
+        
     except Exception as e:
-        logger.error(f"Ошибка в /test: {e}")
-        await message.answer(f"❌ Ошибка: {str(e)[:100]}")
+        logger.error(f"❌ Ошибка при создании проекта: {e}")
+        await message.answer("❌ Произошла ошибка при создании проекта.")
+    
+    await state.clear()
 
-@dp.message(Command("echo"))
-async def cmd_echo(message: Message):
-    logger.info(f"Получен echo: {message.text}")
-    await message.answer(f"Эхо: {message.text}")
-
-@dp.message(F.text == "➕ Проект")
-async def test_button(message: Message):
-    logger.info(f"Нажата кнопка '➕ Проект' от {message.from_user.id}")
-    await message.answer("Тестовая кнопка работает! Для создания проекта используйте команду /newproject")
-
+# Просмотр проектов
 @dp.message(F.text == "📂 Проекты")
-async def test_button2(message: Message):
-    logger.info(f"Нажата кнопка '📂 Проекты' от {message.from_user.id}")
-    await message.answer("Тестовая кнопка работает! Для просмотра проектов используйте команду /listprojects")
+async def show_projects(message: Message):
+    logger.info(f"📁 Просмотр проектов от {message.from_user.id}")
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            projects = await conn.fetch(
+                "SELECT id, name FROM projects WHERE user_id = $1 ORDER BY created_at DESC",
+                message.from_user.id
+            )
+        
+        if not projects:
+            await message.answer(
+                "У вас пока нет проектов. Нажмите ➕ Проект.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        
+        for project in projects:
+            await message.answer(
+                f"📁 {project['name']}",
+                reply_markup=get_project_keyboard(project['id'])
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при получении проектов: {e}")
+        await message.answer("❌ Произошла ошибка при получении проектов.")
 
-# Webhook логика
-async def on_startup(bot: Bot):
-    """Установка вебхука при запуске"""
-    logger.info("🔄 Установка вебхука...")
+# Callback для кнопок проекта
+@dp.callback_query(F.data.startswith("tasks:"))
+async def show_tasks(callback: CallbackQuery):
+    project_id = int(callback.data.split(":")[1])
+    logger.info(f"📋 Задачи проекта {project_id} от {callback.from_user.id}")
     
     try:
-        # Даем время на инициализацию
-        await asyncio.sleep(1)
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            project = await conn.fetchrow(
+                "SELECT name FROM projects WHERE id = $1 AND user_id = $2",
+                project_id, callback.from_user.id
+            )
+            
+            if not project:
+                await callback.answer("Проект не найден!")
+                return
+            
+            tasks = await conn.fetch(
+                "SELECT title, deadline FROM tasks WHERE project_id = $1 ORDER BY deadline ASC",
+                project_id
+            )
         
-        # Получаем информацию о текущем вебхуке
-        current_webhook = await bot.get_webhook_info()
-        logger.info(f"Текущий вебхук: {current_webhook.url}")
-        logger.info(f"Ожидающих обновлений: {current_webhook.pending_update_count}")
+        if not tasks:
+            message_text = f"📁 Проект: {project['name']}\n\nЗадач пока нет."
+        else:
+            message_text = f"📁 Проект: {project['name']}\n\n📋 Задачи:\n"
+            for task in tasks:
+                deadline = task['deadline'].strftime('%d.%m.%y')
+                message_text += f"• {task['title']} — {deadline}\n"
         
-        # Удаляем старый вебхук
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Старый вебхук удален")
-        
-        # Устанавливаем новый
-        await bot.set_webhook(
-            url=WEBHOOK_URL,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types()
+        await callback.message.edit_text(
+            message_text,
+            reply_markup=get_tasks_keyboard(project_id)
         )
-        logger.info(f"✅ Вебхук установлен: {WEBHOOK_URL}")
-        
-        # Проверяем
-        webhook_info = await bot.get_webhook_info()
-        logger.info(f"✅ Информация о вебхуке: {webhook_info.url}")
-        logger.info(f"✅ Ожидающих обновлений: {webhook_info.pending_update_count}")
+        await callback.answer()
         
     except Exception as e:
-        logger.error(f"❌ Ошибка при установке вебхука: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"❌ Ошибка при получении задач: {e}")
+        await callback.answer("❌ Произошла ошибка.")
 
-async def on_shutdown(bot: Bot):
-    """Очистка при выключении"""
-    logger.info("🛑 Остановка бота...")
+# Удаление проекта
+@dp.callback_query(F.data.startswith("delete:"))
+async def delete_project(callback: CallbackQuery):
+    project_id = int(callback.data.split(":")[1])
+    logger.info(f"🗑 Удаление проекта {project_id} от {callback.from_user.id}")
+    
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        if db_pool:
-            await db_pool.close()
-        await bot.session.close()
-        logger.info("Ресурсы освобождены")
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            project = await conn.fetchrow(
+                "SELECT name FROM projects WHERE id = $1 AND user_id = $2",
+                project_id, callback.from_user.id
+            )
+            
+            if not project:
+                await callback.answer("Проект не найден!")
+                return
+            
+            await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
+        
+        await callback.message.edit_text(f"🗑 Проект '{project['name']}' удален.")
+        await callback.answer("✅ Проект удален!")
+        
     except Exception as e:
-        logger.error(f"Ошибка при остановке: {e}")
+        logger.error(f"❌ Ошибка при удалении проекта: {e}")
+        await callback.answer("❌ Произошла ошибка при удалении.")
 
-async def health_check(request):
-    """Health check для Render"""
+# Добавление задачи
+@dp.callback_query(F.data.startswith("add_task:"))
+async def start_add_task(callback: CallbackQuery, state: FSMContext):
+    project_id = int(callback.data.split(":")[1])
+    logger.info(f"➕ Добавление задачи в проект {project_id}")
+    
     try:
-        # Простая проверка без базы данных
-        return web.Response(
-            text="OK",
-            status=200,
-            headers={"Content-Type": "text/plain"}
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            project = await conn.fetchrow(
+                "SELECT id FROM projects WHERE id = $1 AND user_id = $2",
+                project_id, callback.from_user.id
+            )
+            
+            if not project:
+                await callback.answer("Проект не найден!")
+                return
+    
+    except Exception as e:
+        logger.error(f"❌ Ошибка при проверке проекта: {e}")
+        await callback.answer("❌ Произошла ошибка.")
+        return
+    
+    await state.update_data(project_id=project_id)
+    await callback.message.answer("Название задачи?")
+    await state.set_state(TaskState.waiting_for_title)
+    await callback.answer()
+
+@dp.message(TaskState.waiting_for_title)
+async def process_task_title(message: Message, state: FSMContext):
+    title = message.text.strip()
+    
+    if not title:
+        await message.answer("Название задачи не может быть пустым. Введите название:")
+        return
+    
+    await state.update_data(title=title)
+    await message.answer("Дедлайн (ДД.ММ.ГГ, например: 05.02.26)?")
+    await state.set_state(TaskState.waiting_for_deadline)
+
+@dp.message(TaskState.waiting_for_deadline)
+async def process_task_deadline(message: Message, state: FSMContext):
+    deadline_str = message.text.strip()
+    
+    # Валидация формата даты
+    try:
+        deadline = datetime.strptime(deadline_str, '%d.%m.%y').date()
+        today = datetime.now().date()
+        if deadline < today:
+            raise ValueError("Дата в прошлом")
+            
+    except ValueError as e:
+        logger.warning(f"Неверный формат даты: {deadline_str}")
+        await message.answer(
+            "❌ Неверный формат или дата в прошлом. Попробуйте снова (ДД.ММ.ГГ):"
         )
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return web.Response(
-            text="ERROR",
-            status=503,
-            headers={"Content-Type": "text/plain"}
-        )
-
-async def webhook_info_page(request):
-    """Страница с информацией о вебхуке"""
-    try:
-        info = await bot.get_webhook_info()
-        html = f"""
-        <html>
-        <head><title>Telegram Bot Status</title></head>
-        <body>
-            <h1>🤖 Telegram Bot Status</h1>
-            <p><strong>Webhook URL:</strong> {info.url or 'Not set'}</p>
-            <p><strong>Pending Updates:</strong> {info.pending_update_count}</p>
-            <p><strong>Last Error:</strong> {info.last_error_message or 'None'}</p>
-            <p><strong>Last Error Date:</strong> {info.last_error_date or 'None'}</p>
-            <p><strong>Max Connections:</strong> {info.max_connections or 'Not set'}</p>
-            <p><strong>Service URL:</strong> https://{WEBHOOK_HOST}</p>
-            <hr>
-            <p>Health check: <a href="/health">/health</a></p>
-            <p>Webhook endpoint: <a href="/webhook">/webhook</a></p>
-            <p>Status page: <a href="/status">/status</a></p>
-            <p>Test links:</p>
-            <ul>
-                <li><a href="/test">/test</a> - Простой тест</li>
-                <li><a href="/debug">/debug</a> - Отладка</li>
-            </ul>
-        </body>
-        </html>
-        """
-        return web.Response(text=html, content_type="text/html")
-    except Exception as e:
-        logger.error(f"Ошибка в webhook_info_page: {e}")
-        return web.Response(text=f"Error getting webhook info: {e}", status=500)
-
-async def test_page(request):
-    """Тестовая страница"""
-    return web.Response(
-        text="Test page is working!",
-        status=200,
-        headers={"Content-Type": "text/plain"}
-    )
-
-async def debug_page(request):
-    """Страница отладки"""
-    debug_info = f"""
-    Debug Information:
-    - TOKEN: {'SET' if TOKEN else 'NOT SET'}
-    - DATABASE_URL: {'SET' if DATABASE_URL else 'NOT SET'}
-    - WEBHOOK_HOST: {WEBHOOK_HOST}
-    - WEBHOOK_URL: {WEBHOOK_URL}
-    - PORT: {PORT}
-    """
-    return web.Response(
-        text=debug_info,
-        status=200,
-        headers={"Content-Type": "text/plain"}
-    )
-
-async def handle_webhook(request):
-    """Обработчик вебхука вручную для отладки"""
-    logger.info("Получен запрос на /webhook")
-    try:
-        data = await request.json()
-        logger.info(f"Данные вебхука: {data}")
-        return web.Response(text="OK", status=200)
-    except Exception as e:
-        logger.error(f"Ошибка в handle_webhook: {e}")
-        return web.Response(text="ERROR", status=500)
-
-def main():
-    """Запуск приложения"""
-    logger.info("🚀 Запуск приложения...")
+        return
     
-    # Регистрируем обработчики запуска/остановки
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    
-    # Создаем веб-приложение
-    app = web.Application()
-    
-    # Регистрируем вебхук через SimpleRequestHandler
-    webhook_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_handler.register(app, path="/webhook")
-    
-    # Добавляем дополнительные маршруты
-    app.router.add_get("/", webhook_info_page)
-    app.router.add_get("/health", health_check)
-    app.router.add_get("/status", webhook_info_page)
-    app.router.add_get("/test", test_page)
-    app.router.add_get("/debug", debug_page)
-    
-    # Настраиваем приложение
-    setup_application(app, dp, bot=bot)
-    
-    # Запускаем сервер
-    logger.info(f"🚀 Запуск сервера на порту {PORT}")
-    logger.info(f"🌐 Вебхук будет установлен на: {WEBHOOK_URL}")
+    # Сохранение задачи
+    data = await state.get_data()
     
     try:
-        web.run_app(
-            app,
-            host="0.0.0.0",
-            port=PORT,
-            access_log=None
-        )
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO tasks (project_id, title, deadline) VALUES ($1, $2, $3)",
+                data['project_id'], data['title'], deadline
+            )
+        
+        await message.answer("✅ Задача добавлена!")
+        logger.info(f"✅ Задача добавлена в проект {data['project_id']}")
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка при запуске сервера: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        logger.error(f"❌ Ошибка при сохранении задачи: {e}")
+        await message.answer("❌ Произошла ошибка при сохранении задачи.")
+    
+    await state.clear()
+
+# Простое эхо для теста
+@dp.message()
+async def echo_message(message: Message):
+    logger.info(f"📨 Сообщение от {message.from_user.id}: {message.text}")
+    await message.answer(f"Вы сказали: {message.text}")
+
+# Основная функция
+async def main():
+    """Основная функция для запуска бота"""
+    logger.info("🚀 Запуск бота в режиме polling...")
+    
+    # Удаляем возможный вебхук
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Вебхук удален (если был)")
+    
+    # Создаем таблицы
+    await create_tables()
+    
+    # Запускаем polling
+    logger.info("✅ Бот запущен и готов к работе!")
+    logger.info("📱 Отправьте /start вашему боту в Telegram")
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен")
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
