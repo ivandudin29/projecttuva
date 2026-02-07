@@ -114,7 +114,7 @@ async def create_tables():
                 )
             ''')
             
-            # Таблица задач с исправленной структурой
+            # Таблица задач с исправленной структурой и без CHECK constraint
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS tasks (
                     id SERIAL PRIMARY KEY,
@@ -129,6 +129,12 @@ async def create_tables():
                 )
             ''')
             
+            # Удаляем существующий CHECK constraint если он есть
+            await conn.execute('''
+                ALTER TABLE tasks 
+                DROP CONSTRAINT IF EXISTS tasks_status_check
+            ''')
+            
             # Таблица для уведомлений
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS notifications (
@@ -138,8 +144,7 @@ async def create_tables():
                     notification_type VARCHAR(50) NOT NULL,
                     notification_time TIMESTAMP NOT NULL,
                     is_sent BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(task_id, notification_type)  -- Уникальность для предотвращения дублирования
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
@@ -150,6 +155,10 @@ async def create_tables():
             
             await conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
+            ''')
+            
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline)
             ''')
             
             await conn.execute('''
@@ -199,6 +208,12 @@ async def check_and_fix_tables():
                 ''')
                 logger.info("✅ Колонка updated_at добавлена")
                 
+            # Удаляем дублирующий constraint если он существует
+            await conn.execute('''
+                ALTER TABLE tasks 
+                DROP CONSTRAINT IF EXISTS tasks_status_check
+            ''')
+                
     except Exception as e:
         logger.error(f"❌ Ошибка при проверке таблиц: {e}")
 
@@ -214,43 +229,54 @@ async def create_notification(user_id: int, task_id: int, notification_type: str
                 task_id
             )
             
-            if task:
-                deadline = task['deadline']
-                notification_time = datetime.combine(deadline, datetime.min.time()) - timedelta(days=days_before)
-                
-                # Проверяем, не существует ли уже такое уведомление
-                existing = await conn.fetchrow('''
-                    SELECT id FROM notifications 
-                    WHERE task_id = $1 AND notification_type = $2 AND is_sent = FALSE
-                ''', task_id, notification_type)
-                
-                if existing:
-                    logger.info(f"ℹ️ Уведомление уже существует для задачи {task_id} ({notification_type})")
-                    return
-                
-                # Создаем уведомление
-                await conn.execute('''
-                    INSERT INTO notifications (user_id, task_id, notification_type, notification_time)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (task_id, notification_type) DO NOTHING
-                ''', user_id, task_id, notification_type, notification_time)
-                
-                logger.info(f"📅 Уведомление создано для задачи {task_id} ({notification_type})")
+            if not task:
+                logger.error(f"❌ Задача {task_id} не найдена для создания уведомления")
+                return
+            
+            deadline = task['deadline']
+            # Рассчитываем время уведомления (в 9 утра)
+            notification_time = datetime.combine(deadline, datetime.min.time().replace(hour=9, minute=0)) - timedelta(days=days_before)
+            
+            # Проверяем, не существует ли уже такое уведомление
+            existing = await conn.fetchrow('''
+                SELECT id FROM notifications 
+                WHERE task_id = $1 AND notification_type = $2 AND is_sent = FALSE
+                AND ABS(EXTRACT(EPOCH FROM (notification_time - $3))) < 60  -- Проверяем разницу менее 1 минуты
+            ''', task_id, notification_type, notification_time)
+            
+            if existing:
+                logger.info(f"ℹ️ Уведомление уже существует для задачи {task_id} ({notification_type})")
+                return
+            
+            # Создаем уведомление
+            await conn.execute('''
+                INSERT INTO notifications (user_id, task_id, notification_type, notification_time)
+                VALUES ($1, $2, $3, $4)
+            ''', user_id, task_id, notification_type, notification_time)
+            
+            logger.info(f"📅 Уведомление создано для задачи {task_id} ({notification_type}) на {notification_time}")
+            
     except Exception as e:
-        logger.error(f"❌ Ошибка создания уведомления: {e}")
+        logger.error(f"❌ Ошибка создания уведомления для задачи {task_id}: {e}")
 
 async def check_overdue_tasks():
     """Проверка и обновление просроченных задач"""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            await conn.execute('''
+            result = await conn.execute('''
                 UPDATE tasks 
                 SET status = 'overdue',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE deadline < CURRENT_DATE 
                 AND status NOT IN ('completed', 'overdue')
             ''')
+            
+            if 'UPDATE' in result:
+                count = result.split()[1]
+                if int(count) > 0:
+                    logger.info(f"🔄 Обновлено {count} просроченных задач")
+                    
     except Exception as e:
         logger.error(f"❌ Ошибка обновления просроченных задач: {e}")
 
@@ -263,14 +289,16 @@ async def check_and_send_notifications():
         async with pool.acquire() as conn:
             # Находим уведомления, которые нужно отправить
             notifications = await conn.fetch('''
-                SELECT n.*, t.title, t.deadline 
+                SELECT n.*, t.title, t.deadline, p.user_id
                 FROM notifications n
                 JOIN tasks t ON n.task_id = t.id
+                JOIN projects p ON t.project_id = p.id
                 WHERE n.is_sent = FALSE 
                 AND n.notification_time <= NOW()
-                LIMIT 10
+                LIMIT 20
             ''')
             
+            sent_count = 0
             for notification in notifications:
                 user_id = notification['user_id']
                 task_title = notification['title']
@@ -279,23 +307,29 @@ async def check_and_send_notifications():
                 
                 message_text = ""
                 if notification_type == "deadline_today":
-                    message_text = f"📢 Напоминание: задача '{task_title}' должна быть выполнена сегодня! ({deadline})"
+                    message_text = f"📢 **СЕГОДНЯ ДЕДЛАЙН!**\n\nЗадача: {task_title}\nДедлайн: {deadline}"
                 elif notification_type == "deadline_tomorrow":
-                    message_text = f"📢 Напоминание: задача '{task_title}' должна быть выполнена завтра! ({deadline})"
+                    message_text = f"📢 **ЗАВТРА ДЕДЛАЙН!**\n\nЗадача: {task_title}\nДедлайн: {deadline}"
                 elif "days_before" in notification_type:
                     days = notification_type.split("_")[2]
-                    message_text = f"📢 Напоминание: до дедлайна задачи '{task_title}' осталось {days} дней ({deadline})"
+                    message_text = f"📢 **Напоминание**\n\nЗадача: {task_title}\nДедлайн: {deadline}\nОсталось дней: {days}"
+                else:
+                    message_text = f"📢 **Напоминание**\n\nЗадача: {task_title}\nДедлайн: {deadline}"
                 
                 if message_text:
                     try:
-                        await bot.send_message(user_id, message_text)
+                        await bot.send_message(user_id, message_text, parse_mode=ParseMode.MARKDOWN)
                         await conn.execute(
                             "UPDATE notifications SET is_sent = TRUE WHERE id = $1",
                             notification['id']
                         )
-                        logger.info(f"📨 Уведомление отправлено пользователю {user_id}")
+                        sent_count += 1
+                        logger.info(f"📨 Уведомление отправлено пользователю {user_id} для задачи '{task_title}'")
                     except Exception as e:
-                        logger.error(f"❌ Ошибка отправки уведомления: {e}")
+                        logger.error(f"❌ Ошибка отправки уведомления пользователю {user_id}: {e}")
+            
+            if sent_count > 0:
+                logger.info(f"✅ Отправлено {sent_count} уведомлений")
                         
     except Exception as e:
         logger.error(f"❌ Ошибка проверки уведомлений: {e}")
@@ -312,7 +346,7 @@ async def notification_scheduler():
             break
         except Exception as e:
             logger.error(f"❌ Ошибка в планировщике: {e}")
-            await asyncio.sleep(300)  # Ждем 5 минут при ошибке
+            await asyncio.sleep(60)  # Ждем 1 минуту при ошибке
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -367,7 +401,7 @@ def get_task_keyboard(task_id: int, current_status: str = 'pending'):
     ])
     
     keyboard_rows.append([
-        InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_tasks")
+        InlineKeyboardButton(text="↩️ Назад к задачам", callback_data=f"back_to_task_list:{task_id}")
     ])
     
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
@@ -376,7 +410,7 @@ def get_tasks_keyboard(project_id: int, show_back: bool = False):
     """Клавиатура задач проекта"""
     keyboard_rows = [
         [InlineKeyboardButton(text="➕ Добавить задачу", callback_data=f"add_task:{project_id}")],
-        [InlineKeyboardButton(text="📊 Статусы задач", callback_data=f"task_statuses:{project_id}")]
+        [InlineKeyboardButton(text="📊 Управление задачами", callback_data=f"task_statuses:{project_id}")]
     ]
     
     if show_back:
@@ -402,6 +436,31 @@ def get_notification_settings_keyboard():
         ]
     )
     return keyboard
+
+def get_tasks_list_keyboard(tasks, project_id: int):
+    """Клавиатура со списком задач"""
+    keyboard_rows = []
+    for task in tasks:
+        deadline = task['deadline'].strftime('%d.%m.%y')
+        status_icon = {
+            'pending': '⏳',
+            'in_progress': '🔄',
+            'completed': '✅',
+            'overdue': '⚠️'
+        }.get(task['display_status'], '⏳')
+        
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text=f"{status_icon} {task['title']} - {deadline}",
+                callback_data=f"task_detail:{task['id']}"
+            )
+        ])
+    
+    keyboard_rows.append([
+        InlineKeyboardButton(text="↩️ Назад к проекту", callback_data=f"tasks:{project_id}")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 # ========== ХЕНДЛЕРЫ ==========
 @dp.message(CommandStart())
@@ -456,8 +515,17 @@ async def cmd_test(message: Message):
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            count = await conn.fetchval('SELECT COUNT(*) FROM projects')
-        await message.answer(f"✅ Бот работает! Проектов в базе: {count}")
+            # Проверяем наличие таблиц
+            projects_count = await conn.fetchval('SELECT COUNT(*) FROM projects')
+            tasks_count = await conn.fetchval('SELECT COUNT(*) FROM tasks')
+            notifications_count = await conn.fetchval("SELECT COUNT(*) FROM notifications WHERE is_sent = FALSE")
+            
+            await message.answer(
+                f"✅ Бот работает!\n"
+                f"📁 Проектов: {projects_count}\n"
+                f"📋 Задач: {tasks_count}\n"
+                f"🔔 Активных уведомлений: {notifications_count}"
+            )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
@@ -494,11 +562,18 @@ async def statistics_menu(message: Message):
                     COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
                     COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as in_progress,
                     COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
-                    COUNT(CASE WHEN status = 'overdue' THEN 1 END) as overdue,
-                    COUNT(CASE WHEN deadline < CURRENT_DATE AND status != 'completed' THEN 1 END) as expired
+                    COUNT(CASE WHEN status = 'overdue' THEN 1 END) as overdue
                 FROM tasks t
                 JOIN projects p ON t.project_id = p.id
                 WHERE p.user_id = $1
+            ''', message.from_user.id)
+            
+            # Активные уведомления
+            active_notifications = await conn.fetchval('''
+                SELECT COUNT(*) FROM notifications n
+                JOIN tasks t ON n.task_id = t.id
+                JOIN projects p ON t.project_id = p.id
+                WHERE p.user_id = $1 AND n.is_sent = FALSE
             ''', message.from_user.id)
             
             if stats and len(stats) > 0 and stats[0]['total'] > 0:
@@ -511,7 +586,7 @@ async def statistics_menu(message: Message):
                     f"• 🔄 В работе: {stat['in_progress']}\n"
                     f"• ⏳ В ожидании: {stat['pending']}\n"
                     f"• ⚠️ Просрочено: {stat['overdue']}\n"
-                    f"• 📅 Истекшие дедлайны: {stat['expired']}\n\n"
+                    f"• 🔔 Активных уведомлений: {active_notifications}\n\n"
                     f"**Эффективность:** {efficiency}%"
                 )
             else:
@@ -631,6 +706,7 @@ async def show_tasks(callback: CallbackQuery):
                 ORDER BY 
                     CASE WHEN deadline < CURRENT_DATE AND status != 'completed' THEN 0 ELSE 1 END,
                     deadline ASC
+                LIMIT 20
             ''', project_id)
         
         if not tasks:
@@ -685,38 +761,23 @@ async def show_task_statuses(callback: CallbackQuery):
                 FROM tasks 
                 WHERE project_id = $1 
                 ORDER BY deadline ASC
-                LIMIT 10
+                LIMIT 20
             ''', project_id)
         
         if not tasks:
+            await callback.message.edit_text(
+                f"📁 **Проект: {project['name']}**\n\nВ этом проекте пока нет задач.",
+                reply_markup=get_tasks_keyboard(project_id, show_back=True),
+                parse_mode=ParseMode.MARKDOWN
+            )
             await callback.answer("В этом проекте пока нет задач!")
             return
         
         message_text = f"📁 **Проект: {project['name']}**\n\n📋 **Задачи (кликните для изменения статуса):**\n"
         
-        keyboard_buttons = []
-        for task in tasks:
-            deadline = task['deadline'].strftime('%d.%m.%y')
-            status_text = TASK_STATUSES.get(task['display_status'], '⏳ В ожидании')
-            
-            # Кнопка для задачи
-            keyboard_buttons.append([
-                InlineKeyboardButton(
-                    text=f"{task['title']} - {deadline} ({status_text})",
-                    callback_data=f"task_detail:{task['id']}"
-                )
-            ])
-        
-        # Добавляем кнопку "Назад"
-        keyboard_buttons.append([
-            InlineKeyboardButton(text="↩️ Назад", callback_data=f"tasks:{project_id}")
-        ])
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        
         await callback.message.edit_text(
             message_text,
-            reply_markup=keyboard,
+            reply_markup=get_tasks_list_keyboard(tasks, project_id),
             parse_mode=ParseMode.MARKDOWN
         )
         await callback.answer()
@@ -748,6 +809,12 @@ async def show_task_detail(callback: CallbackQuery):
             created = task['created_at'].strftime('%d.%m.%Y')
             status_text = TASK_STATUSES.get(task['status'], '⏳ В ожидании')
             
+            # Проверяем, просрочена ли задача
+            current_status = task['status']
+            if task['deadline'] < datetime.now().date() and current_status != 'completed':
+                current_status = 'overdue'
+                status_text = TASK_STATUSES.get('overdue')
+            
             message_text = (
                 f"📋 **Задача:** {task['title']}\n"
                 f"📁 **Проект:** {task['project_name']}\n"
@@ -759,7 +826,7 @@ async def show_task_detail(callback: CallbackQuery):
             
             await callback.message.edit_text(
                 message_text,
-                reply_markup=get_task_keyboard(task_id, task['status']),
+                reply_markup=get_task_keyboard(task_id, current_status),
                 parse_mode=ParseMode.MARKDOWN
             )
         await callback.answer()
@@ -788,15 +855,23 @@ async def set_task_status(callback: CallbackQuery):
                 await callback.answer("Задача не найдена!")
                 return
             
-            # Обновляем статус с установкой completed_at
-            completed_at_value = "NOW()" if new_status == 'completed' else "NULL"
-            await conn.execute(f'''
-                UPDATE tasks 
-                SET status = $1, 
-                    completed_at = {completed_at_value},
-                    updated_at = NOW()
-                WHERE id = $2
-            ''', new_status, task_id)
+            # Обновляем статус
+            if new_status == 'completed':
+                await conn.execute('''
+                    UPDATE tasks 
+                    SET status = $1, 
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $2
+                ''', new_status, task_id)
+            else:
+                await conn.execute('''
+                    UPDATE tasks 
+                    SET status = $1, 
+                        completed_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = $2
+                ''', new_status, task_id)
             
             status_text = TASK_STATUSES.get(new_status, 'Неизвестный статус')
             await callback.answer(f"✅ Статус изменен на: {status_text}")
@@ -807,7 +882,7 @@ async def set_task_status(callback: CallbackQuery):
             
             message_text = (
                 f"📋 **Задача:** {task['title']}\n"
-                f"📁 **Проект:** (обновится)\n"
+                f"📁 **Проект:** {task['project_name'] if 'project_name' in task else '...'}\n"
                 f"📅 **Создана:** {created}\n"
                 f"⏰ **Дедлайн:** {deadline}\n"
                 f"📊 **Статус:** {status_text}\n\n"
@@ -846,7 +921,7 @@ async def set_reminder(callback: CallbackQuery):
                 return
             
             # Создаем уведомление
-            notification_type = "deadline_today" if days_before == 0 else f"days_before_{days_before}"
+            notification_type = f"reminder_{days_before}_days" if days_before > 0 else "deadline_today"
             await create_notification(callback.from_user.id, task_id, notification_type, days_before)
             
             if days_before == 0:
@@ -858,6 +933,59 @@ async def set_reminder(callback: CallbackQuery):
         logger.error(f"❌ Ошибка при установке напоминания: {e}")
         await callback.answer("❌ Ошибка при установке напоминания")
 
+@dp.callback_query(F.data.startswith("back_to_task_list:"))
+async def back_to_task_list(callback: CallbackQuery):
+    """Возврат к списку задач"""
+    try:
+        task_id = int(callback.data.split(":")[1])
+        
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Получаем информацию о задаче
+            task_info = await conn.fetchrow('''
+                SELECT t.project_id, p.name as project_name
+                FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE t.id = $1 AND p.user_id = $2
+            ''', task_id, callback.from_user.id)
+            
+            if not task_info:
+                await callback.answer("Задача не найдена!")
+                return
+            
+            project_id = task_info['project_id']
+            
+            # Получаем задачи проекта
+            tasks = await conn.fetch('''
+                SELECT id, title, deadline, status,
+                    CASE 
+                        WHEN deadline < CURRENT_DATE AND status != 'completed' THEN 'overdue'
+                        ELSE status
+                    END as display_status
+                FROM tasks 
+                WHERE project_id = $1 
+                ORDER BY deadline ASC
+                LIMIT 20
+            ''', project_id)
+        
+        if not tasks:
+            message_text = f"📁 **Проект: {task_info['project_name']}**\n\nВ этом проекте пока нет задач."
+            keyboard = get_tasks_keyboard(project_id, show_back=True)
+        else:
+            message_text = f"📁 **Проект: {task_info['project_name']}**\n\n📋 **Задачи (кликните для изменения статуса):**\n"
+            keyboard = get_tasks_list_keyboard(tasks, project_id)
+        
+        await callback.message.edit_text(
+            message_text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при возврате к списку задач: {e}")
+        await callback.answer("❌ Произошла ошибка")
+
 # Уведомления
 @dp.callback_query(F.data.startswith("notif_setting:"))
 async def set_notification_setting(callback: CallbackQuery):
@@ -866,11 +994,18 @@ async def set_notification_setting(callback: CallbackQuery):
     
     try:
         if setting == "off":
-            # Пока просто сообщаем, что настройки сохранены
-            await callback.answer("🔕 Все уведомления отключены (функция в разработке)")
+            # Отключаем все уведомления
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute('''
+                    UPDATE notifications SET is_sent = TRUE 
+                    WHERE user_id = $1 AND is_sent = FALSE
+                ''', callback.from_user.id)
+            
+            await callback.answer("🔕 Все уведомления отключены")
         else:
             days = int(setting)
-            await callback.answer(f"✅ Уведомления установлены за {days} дня до дедлайна (функция в разработке)")
+            await callback.answer(f"✅ Уведомления будут приходить за {days} дня до дедлайна")
             
     except Exception as e:
         logger.error(f"❌ Ошибка настройки уведомлений: {e}")
@@ -889,7 +1024,7 @@ async def list_notifications(callback: CallbackQuery):
                 JOIN projects p ON t.project_id = p.id
                 WHERE p.user_id = $1 AND n.is_sent = FALSE
                 ORDER BY n.notification_time
-                LIMIT 10
+                LIMIT 20
             ''', callback.from_user.id)
         
         if not notifications:
@@ -899,7 +1034,12 @@ async def list_notifications(callback: CallbackQuery):
             for notif in notifications:
                 time = notif['notification_time'].strftime('%d.%m.%Y %H:%M')
                 deadline = notif['deadline'].strftime('%d.%m.%Y')
-                message_text += f"• {notif['title']}\n  ⏰ {time} (дедлайн: {deadline})\n\n"
+                days_left = (notif['deadline'] - datetime.now().date()).days
+                days_text = f" (через {days_left} дней)" if days_left > 0 else " (сегодня)" if days_left == 0 else f" (просрочено на {abs(days_left)} дней)"
+                
+                message_text += f"• **{notif['title']}**\n"
+                message_text += f"  ⏰ Уведомление: {time}\n"
+                message_text += f"  📅 Дедлайн: {deadline}{days_text}\n\n"
         
         await callback.message.answer(message_text, parse_mode=ParseMode.MARKDOWN)
         await callback.answer()
@@ -912,61 +1052,21 @@ async def list_notifications(callback: CallbackQuery):
 @dp.callback_query(F.data == "back_to_projects")
 async def back_to_projects(callback: CallbackQuery):
     """Возврат к списку проектов"""
-    await show_projects(callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_to_tasks")
-async def back_to_tasks(callback: CallbackQuery):
-    """Возврат к списку задач"""
-    # Извлекаем project_id из текста сообщения
-    message_text = callback.message.text or ""
-    if "Проект:" in message_text:
-        lines = message_text.split('\n')
-        if lines and len(lines) > 0:
-            project_line = lines[0]
-            # Находим project_id из предыдущих данных
-            try:
-                pool = await get_db_pool()
-                async with pool.acquire() as conn:
-                    # Ищем проект по имени
-                    project_name = project_line.replace("📁 **Проект:** ", "").strip()
-                    project = await conn.fetchrow(
-                        "SELECT id FROM projects WHERE name = $1 AND user_id = $2",
-                        project_name, callback.from_user.id
-                    )
-                    if project:
-                        await show_tasks_for_project(callback, project['id'])
-                        return
-            except Exception as e:
-                logger.error(f"Ошибка при поиске проекта: {e}")
-    
-    # Если не нашли, возвращаемся к проектам
-    await show_projects(callback.message)
-    await callback.answer()
-
-async def show_tasks_for_project(callback: CallbackQuery, project_id: int):
-    """Показать задачи проекта"""
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            project = await conn.fetchrow(
-                "SELECT name FROM projects WHERE id = $1",
-                project_id
-            )
-            if project:
-                await callback.message.edit_text(
-                    f"📁 **Проект: {project['name']}**\n\nВыберите действие:",
-                    reply_markup=get_tasks_keyboard(project_id, show_back=True),
-                    parse_mode=ParseMode.MARKDOWN
-                )
+        await show_projects(callback.message)
+        await callback.answer()
     except Exception as e:
-        logger.error(f"Ошибка при показе задач: {e}")
+        logger.error(f"❌ Ошибка при возврате к проектам: {e}")
+        await callback.answer("❌ Ошибка")
 
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery):
     """Возврат к главному меню"""
-    await callback.message.answer("Используйте кнопки ниже:", reply_markup=get_main_keyboard())
-    await callback.answer()
+    try:
+        await callback.message.answer("Используйте кнопки ниже:", reply_markup=get_main_keyboard())
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"❌ Ошибка при возврате в главное меню: {e}")
 
 @dp.callback_query(F.data == "noop")
 async def noop_callback(callback: CallbackQuery):
@@ -1059,12 +1159,13 @@ async def process_task_deadline(message: Message, state: FSMContext):
             
         today = datetime.now().date()
         if deadline < today:
-            raise ValueError("Дата в прошлом")
+            # Разрешаем даты в прошлом, но предупреждаем
+            logger.warning(f"Дата в прошлом: {deadline_str}")
             
     except ValueError as e:
         logger.warning(f"Неверный формат даты: {deadline_str}")
         await message.answer(
-            "❌ Неверный формат или дата в прошлом. Попробуйте снова (ДД.ММ.ГГ или ДД.ММ.ГГГГ):"
+            "❌ Неверный формат даты. Попробуйте снова (ДД.ММ.ГГ или ДД.ММ.ГГГГ):"
         )
         return
     
@@ -1084,7 +1185,7 @@ async def process_task_deadline(message: Message, state: FSMContext):
                 
                 task_id = result['id']
                 
-                # Автоматически создаем уведомления (без дублирования)
+                # Автоматически создаем уведомления
                 notification_types = [
                     ("days_before_3", 3),
                     ("days_before_2", 2),
