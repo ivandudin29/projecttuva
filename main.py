@@ -52,6 +52,9 @@ logger.info(f"• PORT: {PORT}")
 logger.info(f"• WEBHOOK_HOST: {WEBHOOK_HOST}")
 logger.info(f"• WEBHOOK_URL: {WEBHOOK_URL}")
 
+# Ваш Telegram ID
+TELEGRAM_USER_ID = 209010651
+
 # Инициализация
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -94,6 +97,41 @@ async def get_db_pool():
             logger.error(f"❌ Ошибка при создании пула подключений: {e}")
             raise
     return db_pool
+
+async def migrate_web_data():
+    """Миграция данных из веб-версии на ваш Telegram ID"""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # 1. Обновляем все проекты с user_id = 1 на ваш Telegram ID
+            result = await conn.execute('''
+                UPDATE projects 
+                SET user_id = $1 
+                WHERE user_id = 1 OR user_id IS NULL
+            ''', TELEGRAM_USER_ID)
+            
+            projects_updated = int(result.split()[1]) if 'UPDATE' in result else 0
+            
+            # 2. Получаем количество мигрированных задач
+            tasks_count = await conn.fetchval('''
+                SELECT COUNT(*) 
+                FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE p.user_id = $1
+            ''', TELEGRAM_USER_ID)
+            
+            logger.info(f"✅ Мигрировано {projects_updated} проектов и {tasks_count} задач на ID {TELEGRAM_USER_ID}")
+            return {
+                'success': True,
+                'projects_updated': projects_updated,
+                'tasks_count': tasks_count
+            }
+    except Exception as e:
+        logger.error(f"❌ Ошибка миграции данных: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 async def create_tables():
     """Создание таблиц если их не существует"""
@@ -165,79 +203,6 @@ async def create_tables():
             
     except Exception as e:
         logger.error(f"❌ Ошибка при создании таблиц: {e}")
-        return False
-
-async def migrate_existing_data():
-    """Миграция существующих данных для работы с одним пользователем"""
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            # Получаем ID текущего пользователя (ваш Telegram ID)
-            # Если вы не знаете свой ID, используйте команду /id в боте
-            # Пока используем дефолтный ID 1 для совместимости с веб-версией
-            DEFAULT_USER_ID = 1
-            
-            # Проверяем, есть ли проекты без user_id
-            projects_to_migrate = await conn.fetch('''
-                SELECT id FROM projects WHERE user_id IS NULL OR user_id != $1
-            ''', DEFAULT_USER_ID)
-            
-            if projects_to_migrate:
-                logger.info(f"🔄 Миграция {len(projects_to_migrate)} проектов для пользователя {DEFAULT_USER_ID}")
-                
-                # Обновляем проекты
-                await conn.execute('''
-                    UPDATE projects 
-                    SET user_id = $1 
-                    WHERE user_id IS NULL OR user_id != $1
-                ''', DEFAULT_USER_ID)
-                
-                # Создаем дефолтный проект если нет проектов
-                default_project = await conn.fetchrow('''
-                    SELECT id FROM projects WHERE user_id = $1 LIMIT 1
-                ''', DEFAULT_USER_ID)
-                
-                if not default_project:
-                    await conn.execute('''
-                        INSERT INTO projects (name, user_id, created_at)
-                        VALUES ($1, $2, NOW())
-                    ''', ("Мои задачи", DEFAULT_USER_ID))
-                
-                logger.info(f"✅ Миграция проектов завершена")
-            
-            # Переносим задачи без проекта или с несуществующим проектом
-            tasks_to_migrate = await conn.fetchval('''
-                SELECT COUNT(*) FROM tasks 
-                WHERE project_id IS NULL 
-                OR project_id NOT IN (SELECT id FROM projects WHERE user_id = $1)
-            ''', DEFAULT_USER_ID)
-            
-            if tasks_to_migrate and tasks_to_migrate > 0:
-                logger.info(f"🔄 Миграция {tasks_to_migrate} задач")
-                
-                # Получаем ID дефолтного проекта
-                default_project = await conn.fetchrow('''
-                    SELECT id FROM projects WHERE user_id = $1 LIMIT 1
-                ''', DEFAULT_USER_ID)
-                
-                if default_project:
-                    default_project_id = default_project['id']
-                    
-                    # Обновляем задачи
-                    await conn.execute('''
-                        UPDATE tasks 
-                        SET project_id = $1 
-                        WHERE project_id IS NULL 
-                        OR project_id NOT IN (SELECT id FROM projects WHERE user_id = $2)
-                    ''', default_project_id, DEFAULT_USER_ID)
-                    
-                    logger.info(f"✅ Миграция {tasks_to_migrate} задач завершена")
-            
-            logger.info("✅ Миграция данных завершена успешно")
-            return True
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка при миграции данных: {e}")
         return False
 
 # ========== УВЕДОМЛЕНИЯ ==========
@@ -481,14 +446,20 @@ def get_tasks_list_keyboard(tasks, project_id: int):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     """Команда /start"""
-    logger.info(f"👉 /start от {message.from_user.id}")
-    
-    # Сохраняем ID пользователя для миграции данных
     user_id = message.from_user.id
+    logger.info(f"👉 /start от {user_id}")
+    
+    # Автоматически мигрируем данные если нужно
+    if user_id == TELEGRAM_USER_ID:
+        await message.answer("🔄 Проверка данных из веб-версии...")
+        result = await migrate_web_data()
+        if result['success'] and result['projects_updated'] > 0:
+            await message.answer(f"✅ Перенесено {result['projects_updated']} проектов и {result['tasks_count']} задач из веб-версии!")
     
     await message.answer(
         f"🎉 Добро пожаловать в Task Planner Pro!\n\n"
-        f"Ваш ID: {user_id}\n\n"
+        f"Ваш ID: {user_id}\n"
+        f"Веб-версия также использует этот ID для синхронизации\n\n"
         f"Используйте кнопки ниже:",
         reply_markup=get_main_keyboard()
     )
@@ -500,18 +471,19 @@ async def cmd_help(message: Message):
 📚 **Помощь по командам:**
 
 **Основные команды:**
-/start - Начало работы
+/start - Начало работы (автоматическая миграция)
 /ping - Проверка связи
 /id - Ваш ID
 /status - Статус бота
 /help - Эта справка
-/migrate - Миграция данных
+/migrate - Принудительная миграция данных
 
 **Функционал:**
 • Создание проектов и задач
 • Управление статусами задач
 • Уведомления о дедлайнах
 • Статистика по задачам
+• Синхронизация с веб-версией
 
 **Статусы задач:**
 ⏳ В ожидании - задача не начата
@@ -521,22 +493,38 @@ async def cmd_help(message: Message):
 
 **Уведомления:**
 Бот напомнит о дедлайнах за 3, 2, 1 день и в день выполнения.
+
+**Синхронизация:**
+Все проекты и задачи синхронизируются между ботом и веб-версией.
     """
     await message.answer(help_text, parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(Command("migrate"))
 async def cmd_migrate(message: Message):
-    """Миграция данных для совместимости с веб-версией"""
-    logger.info(f"🔄 Миграция данных от {message.from_user.id}")
+    """Принудительная миграция данных из веб-версии"""
+    user_id = message.from_user.id
+    logger.info(f"🔄 Принудительная миграция от {user_id}")
     
-    await message.answer("🔄 Начинаю миграцию данных...")
+    if user_id != TELEGRAM_USER_ID:
+        await message.answer("❌ Эта команда доступна только владельцу бота.")
+        return
+    
+    await message.answer("🔄 Начинаю принудительную миграцию данных из веб-версии...")
     
     try:
-        success = await migrate_existing_data()
-        if success:
-            await message.answer("✅ Миграция данных завершена успешно!\nТеперь ваши данные видны и в веб-версии, и в боте.")
+        result = await migrate_web_data()
+        if result['success']:
+            if result['projects_updated'] > 0:
+                await message.answer(
+                    f"✅ Успешно мигрировано!\n\n"
+                    f"• Проектов: {result['projects_updated']}\n"
+                    f"• Задач: {result['tasks_count']}\n\n"
+                    f"Теперь все данные из веб-версии доступны в боте!"
+                )
+            else:
+                await message.answer("ℹ️ Нет данных для миграции. Возможно, данные уже синхронизированы.")
         else:
-            await message.answer("❌ Произошла ошибка при миграции данных.")
+            await message.answer(f"❌ Ошибка при миграции: {result['error']}")
     except Exception as e:
         logger.error(f"❌ Ошибка миграции: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
@@ -576,13 +564,38 @@ async def cmd_id(message: Message):
     logger.info(f"🆔 /id от {user_id}")
     
     info_text = f"""
-🆔 **Ваш ID:** `{user_id}`
+🆔 **Ваш Telegram ID:** `{user_id}`
 
-**Для веб-версии:**
-• Используется фиксированный ID: `1`
-• Для совместимости используйте команду `/migrate`
-• После миграции все данные будут доступны и в вебе, и в боте
+**Синхронизация с веб-версией:**
+• Веб-версия настроена на использование ID: `{TELEGRAM_USER_ID}`
+• Для синхронизации используйте команду `/migrate`
+• Все данные автоматически синхронизируются между ботом и вебом
+
+**Текущий статус:**
 """
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Проверяем данные для этого пользователя
+            user_projects = await conn.fetchval('SELECT COUNT(*) FROM projects WHERE user_id = $1', user_id)
+            user_tasks = await conn.fetchval('''
+                SELECT COUNT(*) FROM tasks t 
+                JOIN projects p ON t.project_id = p.id 
+                WHERE p.user_id = $1
+            ''', user_id)
+            
+            info_text += f"• Ваших проектов: {user_projects}\n"
+            info_text += f"• Ваших задач: {user_tasks}\n"
+            
+            # Проверяем данные с user_id = 1 (старые данные из веба)
+            web_projects = await conn.fetchval('SELECT COUNT(*) FROM projects WHERE user_id = 1')
+            if web_projects > 0:
+                info_text += f"\n⚠️ **Обнаружены данные из веб-версии:** {web_projects} проектов\n"
+                info_text += f"Используйте команду `/migrate` чтобы перенести их в ваш аккаунт."
+    
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения информации: {e}")
     
     await message.answer(info_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -680,14 +693,31 @@ async def process_project_name(message: Message, state: FSMContext):
 # Просмотр проектов
 @dp.message(F.text == "📂 Проекты")
 async def show_projects(message: Message):
-    logger.info(f"📁 Просмотр проектов от {message.from_user.id}")
+    user_id = message.from_user.id
+    logger.info(f"📁 Просмотр проектов от {user_id}")
+    
+    # Если это владелец, проверяем миграцию
+    if user_id == TELEGRAM_USER_ID:
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                # Проверяем есть ли данные с user_id = 1
+                web_data_count = await conn.fetchval('SELECT COUNT(*) FROM projects WHERE user_id = 1')
+                if web_data_count > 0:
+                    await message.answer(
+                        f"⚠️ Обнаружено {web_data_count} проектов из веб-версии.\n"
+                        f"Используйте команду `/migrate` чтобы перенести их в ваш аккаунт."
+                    )
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки веб-данных: {e}")
+    
     try:
         pool = await get_db_pool()
         
         async with pool.acquire() as conn:
             projects = await conn.fetch(
                 "SELECT id, name FROM projects WHERE user_id = $1 ORDER BY created_at DESC",
-                message.from_user.id
+                user_id
             )
         
         if not projects:
@@ -724,14 +754,15 @@ async def show_projects(message: Message):
 @dp.callback_query(F.data.startswith("tasks:"))
 async def show_tasks(callback: CallbackQuery):
     project_id = int(callback.data.split(":")[1])
-    logger.info(f"📋 Задачи проекта {project_id} от {callback.from_user.id}")
+    user_id = callback.from_user.id
+    logger.info(f"📋 Задачи проекта {project_id} от {user_id}")
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             project = await conn.fetchrow(
                 "SELECT name FROM projects WHERE id = $1 AND user_id = $2",
-                project_id, callback.from_user.id
+                project_id, user_id
             )
             
             if not project:
@@ -783,13 +814,14 @@ async def show_tasks(callback: CallbackQuery):
 async def show_task_statuses(callback: CallbackQuery):
     """Показать задачи с возможностью изменения статуса"""
     project_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             project = await conn.fetchrow(
                 "SELECT name FROM projects WHERE id = $1 AND user_id = $2",
-                project_id, callback.from_user.id
+                project_id, user_id
             )
             
             if not project:
@@ -834,6 +866,7 @@ async def show_task_statuses(callback: CallbackQuery):
 async def show_task_detail(callback: CallbackQuery):
     """Детальная информация о задаче с выбором статуса"""
     task_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
     
     try:
         pool = await get_db_pool()
@@ -843,7 +876,7 @@ async def show_task_detail(callback: CallbackQuery):
                 FROM tasks t
                 JOIN projects p ON t.project_id = p.id
                 WHERE t.id = $1 AND p.user_id = $2
-            ''', task_id, callback.from_user.id)
+            ''', task_id, user_id)
             
             if not task:
                 await callback.answer("Задача не найдена!")
@@ -884,6 +917,7 @@ async def set_task_status(callback: CallbackQuery):
     """Изменение статуса задачи"""
     _, task_id, new_status = callback.data.split(":")
     task_id = int(task_id)
+    user_id = callback.from_user.id
     
     try:
         pool = await get_db_pool()
@@ -893,7 +927,7 @@ async def set_task_status(callback: CallbackQuery):
                 SELECT t.*, p.id as project_id FROM tasks t
                 JOIN projects p ON t.project_id = p.id
                 WHERE t.id = $1 AND p.user_id = $2
-            ''', task_id, callback.from_user.id)
+            ''', task_id, user_id)
             
             if not task:
                 await callback.answer("Задача не найдена!")
@@ -949,6 +983,7 @@ async def set_reminder(callback: CallbackQuery):
     _, task_id, days_before = callback.data.split(":")
     task_id = int(task_id)
     days_before = int(days_before)
+    user_id = callback.from_user.id
     
     try:
         pool = await get_db_pool()
@@ -958,7 +993,7 @@ async def set_reminder(callback: CallbackQuery):
                 SELECT t.* FROM tasks t
                 JOIN projects p ON t.project_id = p.id
                 WHERE t.id = $1 AND p.user_id = $2
-            ''', task_id, callback.from_user.id)
+            ''', task_id, user_id)
             
             if not task:
                 await callback.answer("Задача не найдена!")
@@ -966,7 +1001,7 @@ async def set_reminder(callback: CallbackQuery):
             
             # Создаем уведомление
             notification_type = f"reminder_{days_before}_days" if days_before > 0 else "deadline_today"
-            await create_notification(callback.from_user.id, task_id, notification_type, days_before)
+            await create_notification(user_id, task_id, notification_type, days_before)
             
             if days_before == 0:
                 await callback.answer("✅ Напоминание установлено на сегодня!")
@@ -980,6 +1015,8 @@ async def set_reminder(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("back_to_task_list:"))
 async def back_to_task_list(callback: CallbackQuery):
     """Возврат к списку задач"""
+    user_id = callback.from_user.id
+    
     try:
         task_id = int(callback.data.split(":")[1])
         
@@ -991,7 +1028,7 @@ async def back_to_task_list(callback: CallbackQuery):
                 FROM tasks t
                 JOIN projects p ON t.project_id = p.id
                 WHERE t.id = $1 AND p.user_id = $2
-            ''', task_id, callback.from_user.id)
+            ''', task_id, user_id)
             
             if not task_info:
                 await callback.answer("Задача не найдена!")
@@ -1058,6 +1095,8 @@ async def set_notification_setting(callback: CallbackQuery):
 @dp.callback_query(F.data == "list_notifications")
 async def list_notifications(callback: CallbackQuery):
     """Список активных уведомлений"""
+    user_id = callback.from_user.id
+    
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -1069,7 +1108,7 @@ async def list_notifications(callback: CallbackQuery):
                 WHERE p.user_id = $1 AND n.is_sent = FALSE
                 ORDER BY n.notification_time
                 LIMIT 20
-            ''', callback.from_user.id)
+            ''', user_id)
         
         if not notifications:
             message_text = "🔕 У вас нет активных уведомлений."
@@ -1121,14 +1160,15 @@ async def noop_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delete:"))
 async def delete_project(callback: CallbackQuery):
     project_id = int(callback.data.split(":")[1])
-    logger.info(f"🗑 Удаление проекта {project_id} от {callback.from_user.id}")
+    user_id = callback.from_user.id
+    logger.info(f"🗑 Удаление проекта {project_id} от {user_id}")
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             project = await conn.fetchrow(
                 "SELECT name FROM projects WHERE id = $1 AND user_id = $2",
-                project_id, callback.from_user.id
+                project_id, user_id
             )
             
             if not project:
@@ -1148,6 +1188,7 @@ async def delete_project(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("add_task:"))
 async def start_add_task(callback: CallbackQuery, state: FSMContext):
     project_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
     logger.info(f"➕ Добавление задачи в проект {project_id}")
     
     try:
@@ -1155,7 +1196,7 @@ async def start_add_task(callback: CallbackQuery, state: FSMContext):
         async with pool.acquire() as conn:
             project = await conn.fetchrow(
                 "SELECT id, name FROM projects WHERE id = $1 AND user_id = $2",
-                project_id, callback.from_user.id
+                project_id, user_id
             )
             
             if not project:
@@ -1261,6 +1302,12 @@ async def on_startup(bot: Bot):
         # Создаем и проверяем таблицы
         await create_tables()
         
+        # Автоматическая миграция данных при старте
+        logger.info("🔄 Проверка данных из веб-версии...")
+        result = await migrate_web_data()
+        if result['success'] and result['projects_updated'] > 0:
+            logger.info(f"✅ Автоматически мигрировано {result['projects_updated']} проектов и {result['tasks_count']} задач")
+        
         # Запускаем планировщик уведомлений
         global notification_task
         notification_task = asyncio.create_task(notification_scheduler())
@@ -1339,9 +1386,9 @@ async def home_page(request):
         <p><strong>Status:</strong> ✅ Работает</p>
         <p><strong>URL:</strong> https://{WEBHOOK_HOST}</p>
         <p><strong>Уведомления:</strong> Активны</p>
+        <p><strong>Синхронизация:</strong> Активна (User ID: {TELEGRAM_USER_ID})</p>
         <hr>
         <p><a href="/health">Health Check</a></p>
-        <p><a href="/status">Bot Status</a></p>
     </body>
     </html>
     """
@@ -1376,6 +1423,7 @@ def main():
     # Запускаем сервер
     logger.info(f"🚀 Запуск сервера на порту {PORT}")
     logger.info(f"🌐 Вебхук: {WEBHOOK_URL}")
+    logger.info(f"👤 Используется Telegram ID: {TELEGRAM_USER_ID}")
     
     try:
         web.run_app(
