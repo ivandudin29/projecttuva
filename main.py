@@ -114,7 +114,7 @@ async def create_tables():
                 )
             ''')
             
-            # Таблица задач с исправленной структурой и без CHECK constraint
+            # Таблица задач с исправленной структурой
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS tasks (
                     id SERIAL PRIMARY KEY,
@@ -127,12 +127,6 @@ async def create_tables():
                     completed_at TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            
-            # Удаляем существующий CHECK constraint если он есть
-            await conn.execute('''
-                ALTER TABLE tasks 
-                DROP CONSTRAINT IF EXISTS tasks_status_check
             ''')
             
             # Таблица для уведомлений
@@ -173,57 +167,85 @@ async def create_tables():
         logger.error(f"❌ Ошибка при создании таблиц: {e}")
         return False
 
-async def check_and_fix_tables():
-    """Проверка и исправление структуры таблиц"""
+async def migrate_existing_data():
+    """Миграция существующих данных для работы с одним пользователем"""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Проверяем наличие колонки completed_at
-            columns = await conn.fetch('''
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'tasks' AND column_name = 'completed_at'
-            ''')
+            # Получаем ID текущего пользователя (ваш Telegram ID)
+            # Если вы не знаете свой ID, используйте команду /id в боте
+            # Пока используем дефолтный ID 1 для совместимости с веб-версией
+            DEFAULT_USER_ID = 1
             
-            if not columns:
-                logger.info("🔄 Добавляем колонку completed_at в таблицу tasks...")
-                await conn.execute('''
-                    ALTER TABLE tasks 
-                    ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP
-                ''')
-                logger.info("✅ Колонка completed_at добавлена")
-                
-            # Проверяем наличие колонки updated_at
-            columns = await conn.fetch('''
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'tasks' AND column_name = 'updated_at'
-            ''')
+            # Проверяем, есть ли проекты без user_id
+            projects_to_migrate = await conn.fetch('''
+                SELECT id FROM projects WHERE user_id IS NULL OR user_id != $1
+            ''', DEFAULT_USER_ID)
             
-            if not columns:
-                logger.info("🔄 Добавляем колонку updated_at в таблицу tasks...")
+            if projects_to_migrate:
+                logger.info(f"🔄 Миграция {len(projects_to_migrate)} проектов для пользователя {DEFAULT_USER_ID}")
+                
+                # Обновляем проекты
                 await conn.execute('''
-                    ALTER TABLE tasks 
-                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ''')
-                logger.info("✅ Колонка updated_at добавлена")
+                    UPDATE projects 
+                    SET user_id = $1 
+                    WHERE user_id IS NULL OR user_id != $1
+                ''', DEFAULT_USER_ID)
                 
-            # Удаляем дублирующий constraint если он существует
-            await conn.execute('''
-                ALTER TABLE tasks 
-                DROP CONSTRAINT IF EXISTS tasks_status_check
-            ''')
+                # Создаем дефолтный проект если нет проектов
+                default_project = await conn.fetchrow('''
+                    SELECT id FROM projects WHERE user_id = $1 LIMIT 1
+                ''', DEFAULT_USER_ID)
                 
+                if not default_project:
+                    await conn.execute('''
+                        INSERT INTO projects (name, user_id, created_at)
+                        VALUES ($1, $2, NOW())
+                    ''', ("Мои задачи", DEFAULT_USER_ID))
+                
+                logger.info(f"✅ Миграция проектов завершена")
+            
+            # Переносим задачи без проекта или с несуществующим проектом
+            tasks_to_migrate = await conn.fetchval('''
+                SELECT COUNT(*) FROM tasks 
+                WHERE project_id IS NULL 
+                OR project_id NOT IN (SELECT id FROM projects WHERE user_id = $1)
+            ''', DEFAULT_USER_ID)
+            
+            if tasks_to_migrate and tasks_to_migrate > 0:
+                logger.info(f"🔄 Миграция {tasks_to_migrate} задач")
+                
+                # Получаем ID дефолтного проекта
+                default_project = await conn.fetchrow('''
+                    SELECT id FROM projects WHERE user_id = $1 LIMIT 1
+                ''', DEFAULT_USER_ID)
+                
+                if default_project:
+                    default_project_id = default_project['id']
+                    
+                    # Обновляем задачи
+                    await conn.execute('''
+                        UPDATE tasks 
+                        SET project_id = $1 
+                        WHERE project_id IS NULL 
+                        OR project_id NOT IN (SELECT id FROM projects WHERE user_id = $2)
+                    ''', default_project_id, DEFAULT_USER_ID)
+                    
+                    logger.info(f"✅ Миграция {tasks_to_migrate} задач завершена")
+            
+            logger.info("✅ Миграция данных завершена успешно")
+            return True
+            
     except Exception as e:
-        logger.error(f"❌ Ошибка при проверке таблиц: {e}")
+        logger.error(f"❌ Ошибка при миграции данных: {e}")
+        return False
 
 # ========== УВЕДОМЛЕНИЯ ==========
 async def create_notification(user_id: int, task_id: int, notification_type: str, days_before: int = 0):
-    """Создание уведомления с проверкой на дублирование"""
+    """Создание уведомления"""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Получаем дедлайн задачи
             task = await conn.fetchrow(
                 "SELECT deadline FROM tasks WHERE id = $1",
                 task_id
@@ -234,21 +256,19 @@ async def create_notification(user_id: int, task_id: int, notification_type: str
                 return
             
             deadline = task['deadline']
-            # Рассчитываем время уведомления (в 9 утра)
             notification_time = datetime.combine(deadline, datetime.min.time().replace(hour=9, minute=0)) - timedelta(days=days_before)
             
             # Проверяем, не существует ли уже такое уведомление
             existing = await conn.fetchrow('''
                 SELECT id FROM notifications 
                 WHERE task_id = $1 AND notification_type = $2 AND is_sent = FALSE
-                AND ABS(EXTRACT(EPOCH FROM (notification_time - $3))) < 60  -- Проверяем разницу менее 1 минуты
+                AND ABS(EXTRACT(EPOCH FROM (notification_time - $3))) < 60
             ''', task_id, notification_type, notification_time)
             
             if existing:
                 logger.info(f"ℹ️ Уведомление уже существует для задачи {task_id} ({notification_type})")
                 return
             
-            # Создаем уведомление
             await conn.execute('''
                 INSERT INTO notifications (user_id, task_id, notification_type, notification_time)
                 VALUES ($1, $2, $3, $4)
@@ -283,11 +303,10 @@ async def check_overdue_tasks():
 async def check_and_send_notifications():
     """Проверка и отправка уведомлений"""
     try:
-        await check_overdue_tasks()  # Сначала обновляем просроченные задачи
+        await check_overdue_tasks()
         
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Находим уведомления, которые нужно отправить
             notifications = await conn.fetch('''
                 SELECT n.*, t.title, t.deadline, p.user_id
                 FROM notifications n
@@ -340,13 +359,13 @@ async def notification_scheduler():
     while True:
         try:
             await check_and_send_notifications()
-            await asyncio.sleep(60)  # Проверяем каждую минуту
+            await asyncio.sleep(60)
         except asyncio.CancelledError:
             logger.info("⏰ Планировщик уведомлений остановлен")
             break
         except Exception as e:
             logger.error(f"❌ Ошибка в планировщике: {e}")
-            await asyncio.sleep(60)  # Ждем 1 минуту при ошибке
+            await asyncio.sleep(60)
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -377,10 +396,8 @@ def get_task_keyboard(task_id: int, current_status: str = 'pending'):
     """Клавиатура задачи с выбором статуса"""
     status_buttons = []
     
-    # Создаем кнопки для всех статусов
     for status_key, status_name in TASK_STATUSES.items():
         if status_key == current_status:
-            # Текущий статус - делаем кнопку неактивной
             status_buttons.append(
                 InlineKeyboardButton(text=f"✓ {status_name}", callback_data=f"noop")
             )
@@ -389,12 +406,10 @@ def get_task_keyboard(task_id: int, current_status: str = 'pending'):
                 InlineKeyboardButton(text=status_name, callback_data=f"set_status:{task_id}:{status_key}")
             )
     
-    # Группируем по 2 кнопки в ряд
     keyboard_rows = []
     for i in range(0, len(status_buttons), 2):
         keyboard_rows.append(status_buttons[i:i+2])
     
-    # Добавляем кнопку уведомлений
     keyboard_rows.append([
         InlineKeyboardButton(text="🔔 Напомнить завтра", callback_data=f"remind:{task_id}:1"),
         InlineKeyboardButton(text="🔔 Напомнить сегодня", callback_data=f"remind:{task_id}:0")
@@ -467,10 +482,14 @@ def get_tasks_list_keyboard(tasks, project_id: int):
 async def cmd_start(message: Message):
     """Команда /start"""
     logger.info(f"👉 /start от {message.from_user.id}")
+    
+    # Сохраняем ID пользователя для миграции данных
+    user_id = message.from_user.id
+    
     await message.answer(
-        "🎉 Добро пожаловать в Task Planner Pro!\n\n"
-        "Теперь с уведомлениями и статусами задач!\n\n"
-        "Используйте кнопки ниже:",
+        f"🎉 Добро пожаловать в Task Planner Pro!\n\n"
+        f"Ваш ID: {user_id}\n\n"
+        f"Используйте кнопки ниже:",
         reply_markup=get_main_keyboard()
     )
 
@@ -486,6 +505,7 @@ async def cmd_help(message: Message):
 /id - Ваш ID
 /status - Статус бота
 /help - Эта справка
+/migrate - Миграция данных
 
 **Функционал:**
 • Создание проектов и задач
@@ -504,6 +524,23 @@ async def cmd_help(message: Message):
     """
     await message.answer(help_text, parse_mode=ParseMode.MARKDOWN)
 
+@dp.message(Command("migrate"))
+async def cmd_migrate(message: Message):
+    """Миграция данных для совместимости с веб-версией"""
+    logger.info(f"🔄 Миграция данных от {message.from_user.id}")
+    
+    await message.answer("🔄 Начинаю миграцию данных...")
+    
+    try:
+        success = await migrate_existing_data()
+        if success:
+            await message.answer("✅ Миграция данных завершена успешно!\nТеперь ваши данные видны и в веб-версии, и в боте.")
+        else:
+            await message.answer("❌ Произошла ошибка при миграции данных.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка миграции: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
 @dp.message(Command("ping"))
 async def cmd_ping(message: Message):
     logger.info(f"🏓 /ping от {message.from_user.id}")
@@ -515,15 +552,18 @@ async def cmd_test(message: Message):
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Проверяем наличие таблиц
-            projects_count = await conn.fetchval('SELECT COUNT(*) FROM projects')
-            tasks_count = await conn.fetchval('SELECT COUNT(*) FROM tasks')
+            projects_count = await conn.fetchval('SELECT COUNT(*) FROM projects WHERE user_id = $1', message.from_user.id)
+            tasks_count = await conn.fetchval('''
+                SELECT COUNT(*) FROM tasks t 
+                JOIN projects p ON t.project_id = p.id 
+                WHERE p.user_id = $1
+            ''', message.from_user.id)
             notifications_count = await conn.fetchval("SELECT COUNT(*) FROM notifications WHERE is_sent = FALSE")
             
             await message.answer(
                 f"✅ Бот работает!\n"
-                f"📁 Проектов: {projects_count}\n"
-                f"📋 Задач: {tasks_count}\n"
+                f"📁 Ваших проектов: {projects_count}\n"
+                f"📋 Ваших задач: {tasks_count}\n"
                 f"🔔 Активных уведомлений: {notifications_count}"
             )
     except Exception as e:
@@ -531,13 +571,20 @@ async def cmd_test(message: Message):
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    logger.info(f"🆔 /id от {message.from_user.id}")
-    await message.answer(f"Ваш ID: {message.from_user.id}")
+    """Показать ID пользователя"""
+    user_id = message.from_user.id
+    logger.info(f"🆔 /id от {user_id}")
+    
+    info_text = f"""
+🆔 **Ваш ID:** `{user_id}`
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    logger.info(f"📊 /status от {message.from_user.id}")
-    await message.answer(f"✅ Бот работает на Render\n🌐 URL: {WEBHOOK_HOST}")
+**Для веб-версии:**
+• Используется фиксированный ID: `1`
+• Для совместимости используйте команду `/migrate`
+• После миграции все данные будут доступны и в вебе, и в боте
+"""
+    
+    await message.answer(info_text, parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(F.text == "🔔 Уведомления")
 async def notifications_menu(message: Message):
@@ -637,7 +684,6 @@ async def show_projects(message: Message):
     try:
         pool = await get_db_pool()
         
-        # Сначала получаем все проекты
         async with pool.acquire() as conn:
             projects = await conn.fetch(
                 "SELECT id, name FROM projects WHERE user_id = $1 ORDER BY created_at DESC",
@@ -651,10 +697,8 @@ async def show_projects(message: Message):
             )
             return
         
-        # Для каждого проекта получаем статистику
         for project in projects:
             async with pool.acquire() as conn:
-                # Получаем статистику по задачам проекта
                 tasks_stats = await conn.fetchrow('''
                     SELECT 
                         COUNT(*) as total,
@@ -837,7 +881,7 @@ async def show_task_detail(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("set_status:"))
 async def set_task_status(callback: CallbackQuery):
-    """Изменение статуса задачи - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    """Изменение статуса задачи"""
     _, task_id, new_status = callback.data.split(":")
     task_id = int(task_id)
     
@@ -876,7 +920,7 @@ async def set_task_status(callback: CallbackQuery):
             status_text = TASK_STATUSES.get(new_status, 'Неизвестный статус')
             await callback.answer(f"✅ Статус изменен на: {status_text}")
             
-            # Обновляем сообщение с новой информацией
+            # Обновляем сообщение
             deadline = task['deadline'].strftime('%d.%m.%Y')
             created = task['created_at'].strftime('%d.%m.%Y')
             
@@ -1145,9 +1189,8 @@ async def process_task_title(message: Message, state: FSMContext):
 async def process_task_deadline(message: Message, state: FSMContext):
     deadline_str = message.text.strip()
     
-    # Валидация формата даты (поддерживаем оба формата)
+    # Валидация формата даты
     try:
-        # Пробуем разные форматы
         for fmt in ('%d.%m.%y', '%d.%m.%Y'):
             try:
                 deadline = datetime.strptime(deadline_str, fmt).date()
@@ -1159,7 +1202,6 @@ async def process_task_deadline(message: Message, state: FSMContext):
             
         today = datetime.now().date()
         if deadline < today:
-            # Разрешаем даты в прошлом, но предупреждаем
             logger.warning(f"Дата в прошлом: {deadline_str}")
             
     except ValueError as e:
@@ -1218,10 +1260,6 @@ async def on_startup(bot: Bot):
     try:
         # Создаем и проверяем таблицы
         await create_tables()
-        await check_and_fix_tables()
-        
-        # Даем время на инициализацию
-        await asyncio.sleep(2)
         
         # Запускаем планировщик уведомлений
         global notification_task
@@ -1274,7 +1312,6 @@ async def on_shutdown(bot: Bot):
             except asyncio.CancelledError:
                 pass
         
-        # Не удаляем вебхук при выключении (Render может перезапускать)
         if db_pool:
             await db_pool.close()
         
@@ -1310,55 +1347,6 @@ async def home_page(request):
     """
     return web.Response(text=html, content_type="text/html")
 
-async def status_page(request):
-    """Страница статуса бота"""
-    try:
-        info = await bot.get_webhook_info()
-        html = f"""
-        <html>
-        <head><title>Bot Status</title></head>
-        <body>
-            <h1>🤖 Статус бота</h1>
-            <p><strong>Webhook URL:</strong> {info.url or 'Not set'}</p>
-            <p><strong>Pending Updates:</strong> {info.pending_update_count}</p>
-            <p><strong>Last Error:</strong> {info.last_error_message or 'None'}</p>
-            <p><strong>Max Connections:</strong> {info.max_connections}</p>
-            <p><strong>Service URL:</strong> https://{WEBHOOK_HOST}</p>
-            <hr>
-            <p><a href="/">Главная</a></p>
-            <p><a href="/health">Health Check</a></p>
-        </body>
-        </html>
-        """
-        return web.Response(text=html, content_type="text/html")
-    except Exception as e:
-        return web.Response(text=f"Error: {e}", status=500)
-
-async def manual_set_webhook(request):
-    """Ручная установка вебхука"""
-    try:
-        await bot.set_webhook(
-            url=WEBHOOK_URL,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types(),
-            max_connections=40
-        )
-        info = await bot.get_webhook_info()
-        html = f"""
-        <html>
-        <head><title>Manual Webhook Set</title></head>
-        <body>
-            <h1>✅ Вебхук установлен</h1>
-            <p><strong>URL:</strong> {info.url}</p>
-            <p><strong>Pending Updates:</strong> {info.pending_update_count}</p>
-            <p><a href="/">Главная</a></p>
-        </body>
-        </html>
-        """
-        return web.Response(text=html, content_type="text/html")
-    except Exception as e:
-        return web.Response(text=f"Error: {e}", status=500)
-
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
     """Запуск приложения"""
@@ -1381,8 +1369,6 @@ def main():
     # Добавляем дополнительные маршруты
     app.router.add_get("/", home_page)
     app.router.add_get("/health", health_check)
-    app.router.add_get("/status", status_page)
-    app.router.add_get("/set_webhook", manual_set_webhook)
     
     # Настраиваем приложение
     setup_application(app, dp, bot=bot)
@@ -1390,7 +1376,6 @@ def main():
     # Запускаем сервер
     logger.info(f"🚀 Запуск сервера на порту {PORT}")
     logger.info(f"🌐 Вебхук: {WEBHOOK_URL}")
-    logger.info(f"🔗 Для ручной установки вебхука: https://{WEBHOOK_HOST}/set_webhook")
     
     try:
         web.run_app(
